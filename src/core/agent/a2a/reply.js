@@ -8,16 +8,20 @@
 // no message-log writes (the caller decides whether and where to persist).
 import { callEngineWithFallback } from "../engine-call.js";
 import { readAgentMemory } from "../memory.js";
-import { buildAgentInstructionsBlock } from "../build-agent-system.js";
+import { buildAgentInstructionsBlock, buildAgentSystem } from "../build-agent-system.js";
 import { resolveAgentModel } from "../agent-model.js";
 import { resolveAgentName } from "../../identity/self.js";
 import { readProfileState } from "../../profiles/store.js";
 import { getRuntime } from "../../runtimes/index.js";
-import { runtimeLooksLikeFailure } from "../../runtimes/outcome.js";
+import { runtimeAvailability, runtimeLooksLikeFailure } from "../../runtimes/outcome.js";
+import {
+  getOrCreateAgentRuntimeSession,
+  updateAgentRuntimeSession,
+} from "../../stores/runtime-sessions.js";
 import { runSuperAgent } from "../super-agent.js";
 import { runAgentTurn } from "../run-turn.js";
 import { CHANNELS } from "#core/constants/channels.js";
-import { a2aSessionKey, peerAddress as canonicalPeerAddress } from "./peers.js";
+import { a2aSessionKey, parsePeerAddress, peerAddress as canonicalPeerAddress } from "./peers.js";
 
 // The super-agent's stable slug plus accepted technical aliases. The configured
 // display name is checked separately, so no persona name is hardcoded here.
@@ -200,6 +204,234 @@ function flattenHistory(history) {
   return ["## Earlier in this exchange (oldest first)", ...lines].join("\n\n");
 }
 
+/** The external runtime explicitly declared by a real APX project agent. */
+export function declaredAgentRuntime(agent) {
+  const raw = agent?.fields?.Runtime;
+  return typeof raw === "string" && raw.trim()
+    ? raw.trim().toLowerCase()
+    : null;
+}
+
+// One external conversation must not receive overlapping APX turns.
+// Different fronts have different keys and therefore remain concurrent.
+const runtimeAgentTurnQueues = new Map();
+
+async function acquireRuntimeAgentTurn(key) {
+  const normalizedKey = String(key || "runtime-agent");
+  const previous =
+    runtimeAgentTurnQueues.get(normalizedKey) || Promise.resolve();
+
+  let releaseGate;
+  const gate = new Promise((resolve) => {
+    releaseGate = resolve;
+  });
+
+  const tail = previous
+    .catch(() => {})
+    .then(() => gate);
+
+  runtimeAgentTurnQueues.set(normalizedKey, tail);
+
+  await previous.catch(() => {});
+
+  let released = false;
+
+  return () => {
+    if (released) return;
+    released = true;
+
+    releaseGate();
+
+    tail.finally(() => {
+      if (runtimeAgentTurnQueues.get(normalizedKey) === tail) {
+        runtimeAgentTurnQueues.delete(normalizedKey);
+      }
+    });
+  };
+}
+
+/**
+ * Execute a real APX project agent through its declared external runtime.
+ *
+ * The APX agent remains the actor/identity. The runtime is only its executor.
+ * Persistent external sessions are scoped by project + agent + front/thread.
+ */
+export async function replyAsRuntimeBackedAgent({
+  project,
+  toAgent,
+  fromAgent,
+  body,
+  config,
+  history = [],
+  selfAddress = null,
+  peerAddress = null,
+  mode = "chat",
+  depth = 0,
+  wake = false,
+  timeoutMs = 5 * 60 * 1000,
+  getRuntimeFn = getRuntime,
+  runtimeAvailabilityFn = runtimeAvailability,
+  getOrCreateSessionFn = getOrCreateAgentRuntimeSession,
+  updateSessionFn = updateAgentRuntimeSession,
+}) {
+  const runtime = declaredAgentRuntime(toAgent);
+
+  if (!runtime) {
+    throw new Error(
+      `agent ${toAgent?.slug || "?"} has no Runtime declaration`
+    );
+  }
+
+  let rt;
+
+  try {
+    rt = getRuntimeFn(runtime);
+  } catch (error) {
+    throw new Error(
+      `agent ${toAgent.slug} declares invalid Runtime "${runtime}": ${error.message}`
+    );
+  }
+
+  const availability = await runtimeAvailabilityFn(runtime, rt);
+
+  if (!availability?.ok) {
+    throw new Error(
+      `agent ${toAgent.slug} runtime "${runtime}" is not available: ` +
+      `${availability?.reason || `${rt.binary || runtime} is not runnable`}`
+    );
+  }
+
+  const p = project;
+
+  if (!p?.path || !p?.storagePath) {
+    throw new Error(
+      `agent ${toAgent.slug} runtime "${runtime}" requires project path and storagePath`
+    );
+  }
+
+  const self = selfAddress || toAgent.slug;
+  const peer = peerAddress || fromAgent?.slug || "peer";
+  const runtimeThread = parsePeerAddress(self).thread || null;
+
+  const runtimeSessionKey = [
+    `apx-agent:${p.id ?? p.path}:${toAgent.slug}`,
+    runtimeThread || "",
+  ]
+    .filter(Boolean)
+    .join(":");
+
+  const releaseRuntimeAgentTurn =
+    await acquireRuntimeAgentTurn(runtimeSessionKey);
+
+  try {
+    const session = getOrCreateSessionFn({
+      projectRoot: p.path,
+      storageRoot: p.storagePath,
+      agentSlug: toAgent.slug,
+      runtime,
+      runtimeThread,
+      title: runtimeThread
+        ? `Runtime agent: ${toAgent.slug}:${runtimeThread} (${runtime})`
+        : `Runtime agent: ${toAgent.slug} (${runtime})`,
+    });
+
+    const system = buildAgentSystem(p, toAgent, {
+      invocation: "runtime",
+      runtime,
+      channel: CHANNELS.A2A,
+      channelMeta: {
+        projectId: p.id,
+        projectPath: p.path,
+        from: peer,
+        to: self,
+        mode,
+        a2aDepth: depth,
+      },
+      sender: fromAgent,
+      caller: peer,
+      globalConfig: config,
+      extraParts: [
+        a2aEtiquette({
+          selfAddress: self,
+          peerAddress: peer,
+          config,
+          wake,
+        }),
+      ],
+    });
+
+    // Seed existing A2A history only when creating the external conversation.
+    // Once a real external session exists, its own transcript is authoritative.
+    const carried =
+      session.externalSessionId ? "" : flattenHistory(history);
+
+    const prompt = [
+      carried,
+      `From ${peer}:\n\n${body}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+
+    const startedAt = Date.now();
+
+    const r = await rt.run({
+      system,
+      prompt,
+      cwd: p.path,
+      timeoutMs,
+      sessionKey: runtimeSessionKey,
+      resumeSessionId: session.externalSessionId,
+      mode,
+    });
+
+    const actualSessionId =
+      r.sessionId || session.externalSessionId || null;
+
+    if (actualSessionId) {
+      updateSessionFn({
+        filePath: session.path,
+        externalSessionId: actualSessionId,
+        externalSessionPath: r.externalSessionPath || null,
+      });
+    }
+
+    const timedOut = Date.now() - startedAt >= timeoutMs;
+
+    const failure = runtimeLooksLikeFailure(r, {
+      timedOut,
+      timeoutS: Math.round(timeoutMs / 1000),
+    });
+
+    if (failure.failed) {
+      throw new Error(
+        `agent ${toAgent.slug} runtime "${runtime}" did not answer: ${failure.reason}`
+      );
+    }
+
+    if (!actualSessionId) {
+      throw new Error(
+        `agent ${toAgent.slug} runtime "${runtime}" answered without a persistent session id`
+      );
+    }
+
+    return {
+      text: r.output,
+      usage: null,
+      model: null,
+      trace: [],
+      runtime,
+      runtimeBacked: true,
+      agent: toAgent.slug,
+      actorId: toAgent.slug,
+      mode,
+      sessionId: actualSessionId,
+      apxRuntimeSessionId: session.id,
+    };
+  } finally {
+    releaseRuntimeAgentTurn();
+  }
+}
+
 /**
  * Run one A2A turn against an AGENT: build system, call engine.
  * Returns { text, usage, model }. Throws on engine failure.
@@ -221,6 +453,7 @@ export async function replyAsAgent({
   projectId = null,
   tools = true,
   signal = null,
+  timeoutMs = 5 * 60 * 1000,
   // Where the steps go as they happen. Without it an a2a turn runs blind: the
   // caller registers "X is answering Y" and then has nothing to show for ten
   // minutes, which reads from every surface exactly like a hang. See the
@@ -237,6 +470,30 @@ export async function replyAsAgent({
   watched = false,
   runAgentTurnFn = runAgentTurn,
 }) {
+  if (declaredAgentRuntime(toAgent)) {
+    const runtimeProject = project || {
+      id: projectId || 0,
+      path: projectPath || "",
+      storagePath: projectPath || "",
+      config,
+    };
+
+    return replyAsRuntimeBackedAgent({
+      project: runtimeProject,
+      toAgent,
+      fromAgent,
+      body,
+      config,
+      history,
+      selfAddress,
+      peerAddress,
+      mode,
+      depth,
+      wake,
+      timeoutMs,
+    });
+  }
+
   const modelId = await resolveAgentModel({ agent: toAgent, config, autonomous: !watched });
   if (!modelId) {
     throw new Error(
