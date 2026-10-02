@@ -31,7 +31,7 @@ function senderCwd(raw) {
 import { compactConversation } from "#core/stores/conversations-compactor.js";
 import { getActiveTurnByKey, convTurnKey, superAgentTurnKey, threadTurnKey } from "../active-turns.js";
 import { trackChannelTurn } from "../channel-turn.js";
-import { replyToPeer } from "#core/agent/a2a/reply.js";
+import { replyToPeer, declaredAgentRuntime } from "#core/agent/a2a/reply.js";
 import { MAX_BACKGROUND_DEPTH } from "#core/agent/a2a/background.js";
 import { captureToolTrace, fileA2AReply } from "#core/agent/a2a/file-reply.js";
 import { resolvePeer, peerAddress, senderAddress, refusesCodeMode, NO_CODE_PEERS } from "#core/agent/a2a/peers.js";
@@ -514,12 +514,23 @@ export function register(api, { projects, project, config, plugins, registries }
     // blank row. Usage stays absent on a plain relay — it spends no tokens.
     const attrib = {};
     const overrideModel = typeof model === "string" && model ? model : null;
+    const senderRuntime =
+      !fromAgent.synthetic
+        ? declaredAgentRuntime(fromAgent)
+        : null;
+
     let senderModel = overrideModel;
-    if (!senderModel && !fromAgent.synthetic) {
+
+    // A runtime-backed APC agent did not speak through its inherited/router
+    // model. Its external runtime produced the message, so resolving
+    // `model: inherit` here would create false attribution.
+    if (!senderModel && !senderRuntime && !fromAgent.synthetic) {
       try { senderModel = await resolveAgentModel({ agent: fromAgent, config: p.config || config }); }
       catch { /* no model resolvable → leave the row unattributed */ }
     }
+
     if (senderModel) attrib.model = senderModel;
+    if (senderRuntime) attrib.runtime = senderRuntime;
     if (usage && typeof usage === "object") attrib.usage = usage;
 
     const ts = nowIso();
