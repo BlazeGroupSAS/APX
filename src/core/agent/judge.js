@@ -191,7 +191,37 @@ export function buildJudgeFollowup(verdict, iteration) {
 export function continuableTurn(result) {
   const trace = Array.isArray(result?.trace) ? result.trace : [];
   if (trace.length === 0) return false;
-  return !awaitingUser(result);
+  return !awaitingUser(result) && !awaitingManagedWake(result);
+}
+
+/**
+ * Did this turn deliberately leave work running under APX-managed wake?
+ *
+ * A successful background send with wake enabled is a valid turn boundary:
+ * the sender must stop now, and APX will start a fresh turn when the peer
+ * finishes. Treating that state as "unfinished" makes the continuation judge
+ * push the sender into polling, duplicate delegation, or doing the delegated
+ * work itself.
+ *
+ * Only the LAST action counts. Earlier background work does not excuse a turn
+ * that continued doing something else and then stopped halfway through it.
+ */
+export function awaitingManagedWake(result) {
+  const trace = Array.isArray(result?.trace) ? result.trace : [];
+  const last = trace.at(-1);
+
+  if (last?.tool !== "send_to_agent") return false;
+
+  const r = last?.result;
+  if (!r || typeof r !== "object" || Array.isArray(r)) return false;
+
+  return (
+    r.ok === true &&
+    typeof r.job_id === "string" &&
+    r.job_id.length > 0 &&
+    r.status === "running" &&
+    r.wake === true
+  );
 }
 
 /**
