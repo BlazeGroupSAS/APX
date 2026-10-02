@@ -1,5 +1,7 @@
 import { SUPERAGENT_ACTOR_ID } from "#core/constants/actors.js";
 import { isUnwatchedTurn } from "#core/agent/quota.js";
+import { readAgents } from "#core/apc/parser.js";
+import { findAddressedAgent, parsePeerAddress } from "#core/agent/a2a/peers.js";
 import { messagePeer } from "#core/agent/a2a/delegate.js";
 import { sendInBackground, MAX_BACKGROUND_DEPTH } from "#core/agent/a2a/background.js";
 import { resolveProject } from "../helpers.js";
@@ -77,12 +79,29 @@ export default {
     // it is the super-agent. Never taken from an argument: a sender the caller
     // can choose is a sender the caller can forge, and this writes to a thread
     // the owner reads as a record of who said what.
-    const from = channelMeta?.agentSlug || SUPERAGENT_ACTOR_ID;
-    if (to === from) throw new Error("that is you — send_to_agent is for reaching someone else");
+    const from =
+      channel === CHANNELS.A2A &&
+      typeof channelMeta?.to === "string" &&
+      channelMeta.to.trim()
+        ? channelMeta.to.trim()
+        : channelMeta?.agentSlug || SUPERAGENT_ACTOR_ID;
+
+    const agents = readAgents(p.path);
+    const fromThread = parsePeerAddress(from).thread;
+    const requestedPeer = parsePeerAddress(to);
+    const targetAgent = findAddressedAgent(requestedPeer.name, agents);
+
+    // An unthreaded project-agent inherits the current front.
+    // Explicit threads always win. Runtimes and super-agent are untouched.
+    const effectiveTo =
+      fromThread && !requestedPeer.thread && targetAgent
+        ? `${targetAgent.slug}:${fromThread}`
+        : to;
+    if (effectiveTo === from) throw new Error("that is you — send_to_agent is for reaching someone else");
 
     // Already working on something this sender handed over: report that
     // instead of sending it again (a2a/in-flight.js).
-    const inFlight = followup === true ? null : openJobWith({ projectId: p.id, from, to });
+    const inFlight = followup === true ? null : openJobWith({ projectId: p.id, from, to: effectiveTo });
     if (inFlight) return alreadyRunningReply(inFlight);
     // Inside an a2a turn nobody waits on another agent — see call_agent.
     if (channel === CHANNELS.A2A) background = true;
@@ -112,7 +131,7 @@ export default {
       }
       return messagePeer({
         project: p,
-        to,
+        to: effectiveTo,
         body: message,
         from,
         mode,
@@ -143,7 +162,7 @@ export default {
       return sendInBackground({
         project: p,
         from,
-        to,
+        to: effectiveTo,
         body: message,
         mode,
         // Default true, and deliberately so: the failure this tool exists to
