@@ -38,6 +38,7 @@ import cursorAgent from "./cursor-agent.js";
 import geminiCli from "./gemini-cli.js";
 import qwenCode from "./qwen-code.js";
 import antigravity from "./antigravity.js";
+import devinCloud from "./devin-cloud.js";
 
 const REGISTRY = {
   "claude-code": claudeCode,
@@ -48,6 +49,7 @@ const REGISTRY = {
   "gemini-cli": geminiCli,
   "qwen-code": qwenCode,
   antigravity,
+  "devin-cloud": devinCloud,
 };
 
 export const RUNTIME_IDS = Object.keys(REGISTRY);
@@ -68,6 +70,7 @@ export const RUNTIME_ALIASES = Object.freeze({
   gemini: "gemini-cli",
   qwen: "qwen-code",
   cursor: "cursor-agent",
+  devin: "devin-cloud",
 });
 
 /** The registry id for any accepted spelling, or null when nothing claims it. */
