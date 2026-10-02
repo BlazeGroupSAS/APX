@@ -35,6 +35,12 @@ export default {
               "turns of YOUR thread with them and nothing else of your work.",
           },
           project: { type: "string", description: "Whose roster to resolve `to` in. Defaults to yours." },
+          mode: {
+            type: "string",
+            enum: ["chat", "code"],
+            description:
+              "How the recipient may act. chat is read-only/planning; code allows implementation. Default chat.",
+          },
           background: {
             type: "boolean",
             description:
@@ -64,7 +70,7 @@ export default {
       },
     },
   },
-  makeHandler: ({ projects, globalConfig, plugins, registries, channel, channelMeta, turnSpend }) => async ({ project, to, message, background = false, wake_me = true, followup = false }) => {
+  makeHandler: ({ projects, globalConfig, plugins, registries, channel, channelMeta, turnSpend }) => async ({ project, to, message, mode = "chat", background = false, wake_me = true, followup = false }) => {
     const p = resolveProject(projects, project);
     // WHO is writing. A project agent's turn stamps its slug on the tool
     // context (core/agent/run-turn.js); the super-agent's does not, and there
@@ -109,6 +115,7 @@ export default {
         to,
         body: message,
         from,
+        mode,
         config,
         projects,
         plugins,
@@ -138,6 +145,7 @@ export default {
         from,
         to,
         body: message,
+        mode,
         // Default true, and deliberately so: the failure this tool exists to
         // prevent is an agent that hands work off and never learns what came
         // back. Silence is the expensive default, so it has to be asked for.

@@ -148,6 +148,7 @@ export async function deliverWake(job, { project, config, projects, plugins, reg
       from: job.to,
       to: job.from,
       body: wakeText(job),
+      mode: "chat",
       config,
       projects,
       plugins,
@@ -262,6 +263,7 @@ export function sendInBackground({
   from,
   to,
   body,
+  mode = "chat",
   wake = false,
   timeout_s = DEFAULT_JOB_TIMEOUT_S,
   depth = 0,
@@ -351,7 +353,7 @@ export function sendInBackground({
   // Un-awaited on purpose — this is the whole point of the module. The promise
   // is safe detached because both arms settle the job and neither rethrows.
   Promise.resolve()
-    .then(() => messagePeerFn({ project, from: sender, to: address, body, config, projects, plugins, registries, depth, senderSpend }))
+    .then(() => messagePeerFn({ project, from: sender, to: address, body, mode, config, projects, plugins, registries, depth, senderSpend }))
     .then(
       (result) => closeJob(job.id, { status: "done", result: result?.text || "" }),
       (e) => closeJob(job.id, { status: "failed", result: e?.message || String(e) }),
