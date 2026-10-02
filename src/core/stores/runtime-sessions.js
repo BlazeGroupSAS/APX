@@ -168,6 +168,138 @@ export function readRuntimeSession(storageRoot, id, opts = {}) {
   return { ...row, body: end === -1 ? "" : text.slice(end + 4).trim() };
 }
 
+
+/**
+ * Return the durable external-runtime session owned by one project agent,
+ * or create it on first use.
+ */
+export function getOrCreateAgentRuntimeSession({
+  projectRoot,
+  storageRoot = projectRoot,
+  agentSlug,
+  runtime,
+  runtimeThread = null,
+  title,
+}) {
+  if (!agentSlug) throw new Error("agentSlug required for runtime-backed agent session");
+  if (!runtime) throw new Error(`runtime required for agent ${agentSlug}`);
+
+  const normalizedThread =
+    typeof runtimeThread === "string" && runtimeThread.trim()
+      ? runtimeThread.trim()
+      : null;
+
+  const expectedScope = normalizedThread
+    ? "project_agent_thread"
+    : "project_agent";
+
+  const dir = path.join(storageRoot, "agents", agentSlug, "sessions");
+
+  if (fs.existsSync(dir)) {
+    const matches = fs.readdirSync(dir)
+      .filter((name) => name.endsWith(".md"))
+      .map((name) => {
+        const filePath = path.join(dir, name);
+
+        try {
+          const fields = readFrontmatter(fs.readFileSync(filePath, "utf8"));
+
+          if (
+            !fields ||
+            fields.runtime_scope !== expectedScope ||
+            fields.agent !== agentSlug ||
+            fields.runtime !== runtime
+          ) return null;
+
+          if (
+            normalizedThread
+              ? fields.runtime_thread !== normalizedThread
+              : Boolean(fields.runtime_thread)
+          ) return null;
+
+          return {
+            filePath,
+            fields,
+            mtimeMs: fs.statSync(filePath).mtimeMs,
+          };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const found = matches[0];
+
+    if (found) {
+      return {
+        id: found.fields.id || path.basename(found.filePath, ".md"),
+        filename: path.basename(found.filePath),
+        path: found.filePath,
+        runtime,
+        runtimeThread: normalizedThread,
+        externalSessionId: found.fields.external_session_id || null,
+        externalSessionPath: found.fields.external_session_path || null,
+        created: false,
+      };
+    }
+  }
+
+  const session = createRuntimeSession({
+    projectRoot,
+    storageRoot,
+    agentSlug,
+    runtime,
+    title:
+      title ||
+      (normalizedThread
+        ? `Runtime agent: ${agentSlug}:${normalizedThread} (${runtime})`
+        : `Runtime agent: ${agentSlug} (${runtime})`),
+    cwd: projectRoot,
+  });
+
+  let text = fs.readFileSync(session.path, "utf8");
+  text = setField(text, "runtime_scope", expectedScope);
+
+  if (normalizedThread) {
+    text = setField(text, "runtime_thread", normalizedThread);
+  }
+
+  text = setField(text, "external_session_id", "");
+  fs.writeFileSync(session.path, text);
+
+  return {
+    ...session,
+    runtime,
+    runtimeThread: normalizedThread,
+    externalSessionId: null,
+    externalSessionPath: null,
+    created: true,
+  };
+}
+
+/** Persist the real external thread id returned by the runtime. */
+export function updateAgentRuntimeSession({
+  filePath,
+  externalSessionId,
+  externalSessionPath = null,
+}) {
+  if (!filePath) throw new Error("runtime session filePath required");
+  if (!externalSessionId) throw new Error("external runtime session id required");
+
+  let text = fs.readFileSync(filePath, "utf8");
+  text = setField(text, "external_session_id", externalSessionId);
+
+  if (externalSessionPath) {
+    text = setField(text, "external_session_path", externalSessionPath);
+  }
+
+  text = setField(text, "updated", nowIso());
+  fs.writeFileSync(filePath, text);
+
+  return filePath;
+}
+
 /**
  * How long an open record stays believable.
  *
