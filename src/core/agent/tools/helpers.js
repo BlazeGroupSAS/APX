@@ -58,6 +58,10 @@ export function agentRow(agent) {
     // Only a real override is worth telling the model about — `inherit` says
     // nothing it can act on.
     model: agentForcedModel(agent) || null,
+    runtime:
+      typeof agent.fields?.Runtime === "string" && agent.fields.Runtime.trim()
+        ? agent.fields.Runtime.trim().toLowerCase()
+        : null,
     language: agent.fields?.Language || null,
     description: agent.fields?.Description || null,
     skills: skillsFromFields(agent.fields),
