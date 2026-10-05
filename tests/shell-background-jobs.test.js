@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 
 const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "apx-shelljobs-"));
 process.env.HOME = TMP_HOME;
@@ -59,6 +60,51 @@ function printedSomething(jobId, timeoutMs = 10_000) {
     });
   });
 }
+
+test("background shell uses the shared platform-shell resolver", async () => {
+  fresh();
+
+  const calls = [];
+  const child = new EventEmitter();
+  child.pid = 4242;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.unref = () => {};
+
+  const out = runShellInBackground({
+    project: PROJECT,
+    from: "reels",
+    command: "echo portable",
+    cwd: TMP_HOME,
+    wake: false,
+    shellCommandFn: (command, options) => {
+      assert.equal(command, "echo portable");
+      assert.equal(options.login, true);
+
+      return {
+        file: "platform-shell",
+        args: ["--execute", command],
+        options: { windowsVerbatimArguments: true },
+      };
+    },
+    spawnFn: (file, args, options) => {
+      calls.push({ file, args, options });
+      setTimeout(() => child.emit("close", 0, null), 20);
+      return child;
+    },
+  });
+
+  assert.equal(out.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "platform-shell");
+  assert.deepEqual(calls[0].args, ["--execute", "echo portable"]);
+  assert.equal(calls[0].options.windowsVerbatimArguments, true);
+  assert.equal(calls[0].options.detached, true);
+
+  const job = await ended(out.job_id);
+  assert.equal(job.status, "done");
+  assert.equal(job.exit_code, 0);
+});
 
 test("a long command is launched and the turn is handed straight back", async () => {
   fresh();

@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+
 // How to hand a command line to the platform's shell.
 //
 // WHY THIS IS A FILE AND NOT THREE INLINE CALLS. `spawn("sh", ["-lc", cmd])`
@@ -60,29 +62,61 @@ export function shellCommand(command, { login = false, platform = process.platfo
   };
 }
 
-/** How long a killed process gets to die politely before SIGKILL.
+/** How long a POSIX child gets to die politely before SIGKILL.
  *
- *  Shared by every caller that kills one, because the failure it prevents is
- *  the same everywhere: SIGTERM is a REQUEST, and a child that ignores it (or
- *  whose orphaned grandchild holds the pipes open) leaves a `close` that never
- *  arrives and a promise that never settles. The escalation is what turns a
- *  timeout into an actual ceiling. */
+ *  A child that ignores SIGTERM can otherwise leave `close` pending forever.
+ *  Windows process-tree stops use taskkill /T /F instead, so there is no delayed
+ *  escalation on that branch. */
 export const KILL_GRACE_MS = 5000;
 
 /**
  * Kill a child, and mean it.
  *
- * Signals the process GROUP when the child was spawned detached, so a shell
- * that launched ffmpeg takes ffmpeg with it — killing `sh` alone leaves the
- * real work running while every panel says it stopped.
+ * When `group` is requested, stops the whole process tree: a detached process
+ * group on POSIX, or taskkill /T /F on Windows. Killing only the shell wrapper
+ * can otherwise leave the real work running.
  *
  * @param {import("node:child_process").ChildProcess} child
- * @param {{group?: boolean, graceMs?: number}} [opts]
- * @returns {() => void} cancels the pending SIGKILL — call it once the child is
- *          known to be gone, so a finished process cannot leave a live timer
- *          behind holding a reference to it.
+ * @param {{group?: boolean, graceMs?: number, platform?: string, spawnSyncFn?: Function}} [opts]
+ * @returns {() => void} cancels any pending POSIX SIGKILL escalation. The
+ *          Windows tree-kill branch returns a no-op cleanup function.
  */
-export function killChild(child, { group = false, graceMs = KILL_GRACE_MS } = {}) {
+export function killChild(
+  child,
+  {
+    group = false,
+    graceMs = KILL_GRACE_MS,
+    platform = process.platform,
+    spawnSyncFn = spawnSync,
+  } = {},
+) {
+  // Windows has no POSIX process group to signal with -pid. When the caller
+  // asks for the whole detached tree, use the platform tool made for that:
+  // /T includes descendants and /F makes termination deterministic.
+  if (group && platform === "win32" && child?.pid) {
+    try {
+      const result = spawnSyncFn(
+        "taskkill",
+        ["/pid", String(child.pid), "/t", "/f"],
+        { windowsHide: true, stdio: "ignore" },
+      );
+
+      if (!result?.error && result?.status === 0) {
+        return () => {};
+      }
+    } catch {
+      // Fall through to killing the direct child if taskkill itself failed.
+    }
+
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Already gone, or never started.
+    }
+
+    return () => {};
+  }
+
   const signal = (sig) => {
     try {
       if (group && child.pid) process.kill(-child.pid, sig);
@@ -91,8 +125,11 @@ export function killChild(child, { group = false, graceMs = KILL_GRACE_MS } = {}
       // Already gone, or never started. Either way there is nothing to kill.
     }
   };
+
   signal("SIGTERM");
+
   const timer = setTimeout(() => signal("SIGKILL"), graceMs);
   timer.unref?.();
+
   return () => clearTimeout(timer);
 }

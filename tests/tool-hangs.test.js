@@ -121,6 +121,41 @@ test("a command that really runs still reports normally", async () => {
   assert.equal(out.error, undefined);
 });
 
+test("killChild uses taskkill for a Windows process tree", () => {
+  const calls = [];
+  const directSignals = [];
+
+  const cancel = killChild(
+    {
+      pid: 4242,
+      kill: (signal) => directSignals.push(signal),
+    },
+    {
+      group: true,
+      platform: "win32",
+      spawnSyncFn: (file, args, options) => {
+        calls.push({ file, args, options });
+        return { status: 0, error: null };
+      },
+    },
+  );
+
+  cancel();
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, "taskkill");
+  assert.deepEqual(calls[0].args, ["/pid", "4242", "/t", "/f"]);
+  assert.deepEqual(calls[0].options, {
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  assert.deepEqual(
+    directSignals,
+    [],
+    "a successful tree kill must not fall back to killing only the wrapper",
+  );
+});
+
 test("killChild escalates to SIGKILL when SIGTERM is ignored", async () => {
   const signals = [];
   const fake = { pid: 4242, kill: (s) => signals.push(s) };

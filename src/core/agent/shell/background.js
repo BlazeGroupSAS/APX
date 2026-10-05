@@ -23,10 +23,10 @@
 //      line that MOVES — which is the whole of what was asked for — and the full
 //      stream goes to a log file beside the record, because 4 000 characters is
 //      a progress indicator and not a debuggable record.
-//   2. IT IS KILLABLE. `detached: true` makes the child a process-group leader,
-//      so cancelling signals `-pid` and takes the whole tree with it. Without
-//      the group, killing `sh -lc "ffmpeg …"` kills the shell and leaves ffmpeg
-//      running: the panel would say stopped and the fans would say otherwise.
+//   2. IT IS KILLABLE. The child is detached, and cancellation targets the
+//      whole process tree rather than only the shell wrapper. POSIX signals the
+//      detached process group; Windows uses taskkill /T /F. Either way ffmpeg
+//      must die with the shell, or the panel would say stopped while work runs.
 //   3. IT OUTLIVES US, and that is on purpose. A detached child survives a
 //      daemon restart — `apx restart` happens here several times an hour, and
 //      losing a twenty-minute render to one would be worse than the alternative.
@@ -36,6 +36,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { shellCommand, killChild } from "#core/util/shell.js";
 import {
   openJob, readJob, updateJob, closeJob, countOpenJobs, jobLogPath,
   JOB_KINDS, MAX_OPEN_JOBS_PER_AGENT, DEFAULT_JOB_TIMEOUT_S, TERMINAL_STATUSES,
@@ -56,18 +57,15 @@ export const SHELL_TAIL_MAX = 4000;
  *  hundreds of lines a second; a write per line would be a write per line. */
 const PROGRESS_MS = 2000;
 
-/** How long a killed process gets to die politely before SIGKILL. */
-const KILL_GRACE_MS = 5000;
-
 /**
  * The children this daemon spawned, by job id.
  *
  * Cancelling kills through THIS map and never through the pid on the record,
  * and the difference matters: a job left by a previous daemon has a pid this
- * machine may have recycled onto something else entirely, and `kill(-pid)` on a
- * recycled group is how a stop button comes to kill somebody's editor. A job
- * this process does not hold is not cancellable — the reconciler closes it
- * instead.
+ * machine may have recycled onto something else entirely. Reusing that stored
+ * pid for either a POSIX group signal or a Windows tree kill could stop unrelated
+ * work. A job this process does not hold is not cancellable ? the reconciler
+ * closes it instead.
  */
 const live = new Map();
 
@@ -77,20 +75,9 @@ function appendTail(tail, chunk) {
   return next.length > SHELL_TAIL_MAX ? next.slice(next.length - SHELL_TAIL_MAX) : next;
 }
 
-/** Signal a job's whole process group. Best-effort by construction: the group
- *  may have exited between the decision and the syscall. */
-function signalGroup(pid, signal) {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(-pid, signal);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
- * Stop a running shell job's process tree. Returns whether anything was signalled.
+ * Stop a running shell job's process tree. Returns whether live work was found
+ * and a stop was requested.
  *
  * The `abortFn` half of `cancelJob` for shell work — the counterpart of
  * `abortActiveTurn` for an a2a job. Closing the RECORD is not this function's
@@ -98,14 +85,11 @@ function signalGroup(pid, signal) {
  */
 export function killShellJob(job) {
   const entry = live.get(job?.id);
-  if (!entry) return false;
-  const sent = signalGroup(entry.pid, "SIGTERM");
-  // The second signal is not optional in practice: ffmpeg and anything wrapping
-  // it will finish the frame it is on, and some tools trap SIGTERM and keep
-  // going. A stop button that leaves the work running is not a stop button.
-  entry.killTimer = setTimeout(() => signalGroup(entry.pid, "SIGKILL"), KILL_GRACE_MS);
-  entry.killTimer.unref?.();
-  return sent;
+  if (!entry?.child?.pid) return false;
+
+  entry.cancelKill?.();
+  entry.cancelKill = killChild(entry.child, { group: true });
+  return true;
 }
 
 /** Is this job's process still held by this daemon? */
@@ -188,6 +172,7 @@ export function runShellInBackground({
   wake = true,
   origin = null,
   spawnFn = spawn,
+  shellCommandFn = shellCommand,
 }) {
   if (!project) return { error: "background shell: no project" };
   if (!from) return { error: "background shell: no agent to wake" };
@@ -228,12 +213,16 @@ export function runShellInBackground({
     log = null; // a job without a log file is still a job
   }
 
+  const shell = shellCommandFn(command, { login: true });
+
   let child;
   try {
-    child = spawnFn("sh", ["-lc", command], {
+    child = spawnFn(shell.file, shell.args, {
       cwd: cwd || undefined,
       env: process.env,
-      // A process group of its own, so cancelling reaches the whole tree.
+      ...shell.options,
+      // Detached so long work can outlive the daemon. killChild handles the
+      // platform-specific tree stop: process group on POSIX, taskkill on Windows.
       detached: true,
     });
   } catch (e) {
@@ -242,7 +231,7 @@ export function runShellInBackground({
     return { error: `background shell: could not start the command — ${e?.message || e}` };
   }
 
-  const entry = { pid: child.pid, child, killTimer: null };
+  const entry = { pid: child.pid, child, cancelKill: null };
   live.set(job.id, entry);
 
   let tail = "";
@@ -270,9 +259,8 @@ export function runShellInBackground({
 
   const timer = setTimeout(() => {
     timedOut = true;
-    signalGroup(child.pid, "SIGTERM");
-    entry.killTimer = setTimeout(() => signalGroup(child.pid, "SIGKILL"), KILL_GRACE_MS);
-    entry.killTimer.unref?.();
+    entry.cancelKill?.();
+    entry.cancelKill = killChild(child, { group: true });
   }, ttl * 1000);
   timer.unref?.();
 
@@ -280,7 +268,7 @@ export function runShellInBackground({
 
   child.on("close", (code, signal) => {
     clearTimeout(timer);
-    if (entry.killTimer) clearTimeout(entry.killTimer);
+    entry.cancelKill?.();
     live.delete(job.id);
     try { log?.end(); } catch { /* best-effort */ }
     updateJob(job.id, { tail });
