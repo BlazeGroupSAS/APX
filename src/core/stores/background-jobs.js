@@ -64,17 +64,15 @@ export function jobKind(job) {
 }
 
 /**
- * How many jobs one agent may have open at once.
+ * Background concurrency is scoped by job family.
  *
- * The fan-out wall, and the reason it is a COUNT and not just a depth limit: a
- * depth limit stops a chain, but nothing stops one turn from opening twenty
- * jobs side by side, each of which wakes a turn that can open twenty more. The
- * a2a depth guard (`_depth`, wall at 3) bounds how DEEP this goes; this bounds
- * how WIDE. Three is enough to leave two things running and ask a third, and
- * small enough that hitting it is a signal the model should read rather than a
- * ceiling it silently lives under.
+ * Shell work keeps the conservative three-job ceiling. A2A coordination gets
+ * sixteen independent slots so one manager can fan work out without shell jobs
+ * consuming delegation capacity, or delegations consuming shell capacity.
+ * The depth wall separately bounds active A2A nesting at twelve.
  */
 export const MAX_OPEN_JOBS_PER_AGENT = 3;
+export const MAX_OPEN_A2A_JOBS_PER_AGENT = 16;
 
 /** Jobs that are over. A terminal job is never delivered again — see claimWake.
  *
@@ -85,9 +83,10 @@ export const MAX_OPEN_JOBS_PER_AGENT = 3;
  * stopped" will ask what to do instead. */
 export const TERMINAL_STATUSES = Object.freeze(["done", "failed", "timed_out", "lost", "cancelled"]);
 
-/** Default wall-clock life of a job, matching the background budget the a2a
- *  route already advertises for a detached send. */
+/** Default wall-clock budgets by job family.
+ * Shell keeps one hour by default; detached A2A work gets twelve hours. */
 export const DEFAULT_JOB_TIMEOUT_S = 3600;
+export const DEFAULT_A2A_JOB_TIMEOUT_S = 12 * 60 * 60;
 
 const SAFE_ID = /^[A-Za-z0-9._-]+$/;
 
@@ -278,7 +277,7 @@ export function wakeClaimed(id) {
 }
 
 /** Every job on disk, newest first. Corrupt files are skipped, not thrown. */
-export function listJobs({ project_id = null, from = null, status = null, open_only = false } = {}) {
+export function listJobs({ project_id = null, from = null, status = null, kind = null, open_only = false } = {}) {
   let files;
   try {
     files = fs.readdirSync(BACKGROUND_JOBS_DIR).filter((f) => f.endsWith(".json"));
@@ -289,6 +288,7 @@ export function listJobs({ project_id = null, from = null, status = null, open_o
   for (const f of files) {
     const job = readJson(path.join(BACKGROUND_JOBS_DIR, f), null);
     if (!job?.id) continue;
+    if (kind && jobKind(job) !== kind) continue;
     if (project_id != null && String(job.project_id) !== String(project_id)) continue;
     if (from && job.from !== from) continue;
     if (status && job.status !== status) continue;
@@ -312,8 +312,8 @@ export function listJobs({ project_id = null, from = null, status = null, open_o
 }
 
 /** How many jobs this agent has open right now. The MAX_OPEN_JOBS_PER_AGENT gate. */
-export function countOpenJobs({ project_id = null, from }) {
-  return listJobs({ project_id, from, open_only: true }).length;
+export function countOpenJobs({ project_id = null, from, kind = null }) {
+  return listJobs({ project_id, from, kind, open_only: true }).length;
 }
 
 /**

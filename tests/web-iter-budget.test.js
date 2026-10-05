@@ -58,12 +58,12 @@ test("channelToolIters — a2a is not a chat, and not a blank cheque either", ()
   assert.ok(A2A_TOOL_ITERS > MAX_TOOL_ITERS, "a peer asked to do the work has room to do it");
   // But not run-to-completion: replyAsAgent honours no timeoutMs (only
   // replyAsRuntime does), so nothing but this number stops a runaway — and a
-  // chain is walled at MAX_BACKGROUND_DEPTH (3) on every path — tools and
-  // `POST /send` alike — so four of these is a generous ceiling that must
+  // chain is walled at MAX_BACKGROUND_DEPTH (12) on every path — tools and
+  // `POST /send` alike — so thirteen of these is still a bounded ceiling that must
   // still cost less than one watched turn.
   assert.ok(
-    A2A_TOOL_ITERS * 4 <= WEB_TOOL_ITERS,
-    `four chained a2a turns (${A2A_TOOL_ITERS} each) must stay within the ${WEB_TOOL_ITERS} one watched turn may spend`,
+    A2A_TOOL_ITERS * 13 <= WEB_TOOL_ITERS,
+    `thirteen chained a2a turns (${A2A_TOOL_ITERS} each) must stay within the ${WEB_TOOL_ITERS} one watched turn may spend`,
   );
   assert.equal(channelToolIters({ super_agent: { a2a_max_iters: 7 } }, CHANNELS.A2A), 7);
   assert.equal(channelToolIters({ super_agent: { a2a_max_iters: 0 } }, CHANNELS.A2A), A2A_TOOL_ITERS);

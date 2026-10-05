@@ -193,7 +193,7 @@ export function runShellInBackground({
   if (!from) return { error: "background shell: no agent to wake" };
   if (!command) return { error: "background shell: command required" };
 
-  const open = countOpenJobs({ project_id: project.id ?? null, from });
+  const open = countOpenJobs({ project_id: project.id ?? null, from, kind: JOB_KINDS.SHELL });
   if (open >= MAX_OPEN_JOBS_PER_AGENT) {
     return {
       error:

@@ -128,7 +128,7 @@ test("send_to_agent: from a one-shot `apx exec`, a background hand-off waits ins
   const root = makeTempProject({ name: "northwind", agents: [{ slug: "ansel" }] });
   try {
     const projects = { get: () => ({ id: 1, path: root, name: "northwind", config: {} }), list: () => [{ id: 1 }] };
-    const atWall = { a2aDepth: MAX_BACKGROUND_DEPTH - 1 };
+    const atWall = { a2aDepth: MAX_BACKGROUND_DEPTH };
     const cli = await sendToAgent.makeHandler({ projects, channel: "cli", channelMeta: atWall })({ to: "ansel", message: "fix it", background: true });
     assert.match(cli.error, /^send_to_agent: hand-off depth limit/, "the blocking path ran");
     const tg = await sendToAgent.makeHandler({ projects, channel: "telegram", channelMeta: atWall })({ to: "ansel", message: "fix it", background: true });

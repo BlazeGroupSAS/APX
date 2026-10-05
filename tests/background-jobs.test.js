@@ -20,7 +20,7 @@ const { default: assert } = await import("node:assert/strict");
 const {
   openJob, readJob, closeJob, claimWake, wakeClaimed, listJobs, countOpenJobs,
   deleteJob, pruneJobs, ownerAlive, jobExpired,
-  BACKGROUND_JOBS_DIR, MAX_OPEN_JOBS_PER_AGENT, TERMINAL_STATUSES, DEFAULT_JOB_TIMEOUT_S,
+  BACKGROUND_JOBS_DIR, JOB_KINDS, MAX_OPEN_JOBS_PER_AGENT, TERMINAL_STATUSES, DEFAULT_JOB_TIMEOUT_S,
 } = await import("#core/stores/background-jobs.js");
 
 function fresh() {
@@ -150,6 +150,17 @@ test("jobs are scoped by project, so one project cannot spend another's budget",
   openJob({ project_id: 9, from: "ansel", to: "roby" });
   assert.equal(countOpenJobs({ project_id: 7, from: "ansel" }), 1);
   assert.equal(countOpenJobs({ project_id: 9, from: "ansel" }), 1);
+});
+
+test("job-family filters keep shell and a2a capacity independent", () => {
+  fresh();
+  openJob({ project_id: 7, kind: JOB_KINDS.A2A, from: "ansel", to: "roby" });
+  openJob({ project_id: 7, kind: JOB_KINDS.SHELL, from: "ansel", command: "echo ok" });
+
+  assert.equal(countOpenJobs({ project_id: 7, from: "ansel", kind: JOB_KINDS.A2A }), 1);
+  assert.equal(countOpenJobs({ project_id: 7, from: "ansel", kind: JOB_KINDS.SHELL }), 1);
+  assert.equal(listJobs({ project_id: 7, kind: JOB_KINDS.A2A }).length, 1);
+  assert.equal(listJobs({ project_id: 7, kind: JOB_KINDS.SHELL }).length, 1);
 });
 
 // ── Recovery inputs ─────────────────────────────────────────────────────────

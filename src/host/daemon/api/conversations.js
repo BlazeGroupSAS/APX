@@ -437,16 +437,16 @@ export function register(api, { projects, project, config, plugins, registries }
     // because receiving a message must not be enough to let the sender rewrite
     // your checkout — opening a coding session is a decision.
     const mode = code ? "code" : "chat";
-    // A conversation answers in seconds; a coding session does not. Background
-    // runs get the hour that `call_runtime` gives its own detached spawns.
-    const timeoutMs = (Number(timeout_s) || (background ? 3600 : 300)) * 1000;
+    // Foreground A2A keeps five minutes. Detached background A2A gets twelve
+    // hours so long coding runtimes share the same budget as the durable job.
+    const timeoutMs = (Number(timeout_s) || (background ? 12 * 60 * 60 : 300)) * 1000;
     if (!fromRaw || !toRaw || !body)
       return res.status(400).json({ error: "from, to, body required" });
     // The same wall the tools apply (send_to_agent / call_agent): the peer this
     // opens runs at `_depth + 1`, and a chain stops at MAX_BACKGROUND_DEPTH. It
     // used to be `_depth > 3`, which the CLI could never reach — it always sent 0
     // — so an agent shelling out `apx send` walked straight past the wall.
-    if ((Number(_depth) || 0) + 1 >= MAX_BACKGROUND_DEPTH)
+    if ((Number(_depth) || 0) + 1 > MAX_BACKGROUND_DEPTH)
       return res.status(429).json({ error: `a2a depth limit (${MAX_BACKGROUND_DEPTH}) exceeded` });
 
     // Urgency tag: blocker|status|fyi. Only a known tag is kept — an unknown one

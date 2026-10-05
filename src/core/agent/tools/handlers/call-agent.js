@@ -60,12 +60,12 @@ export default {
     // The chain counts here too. Without it a delegation restarted every
     // chain at depth 0, and the depth wall only held for send_to_agent.
     const depth = Number(channelMeta?.a2aDepth) || 0;
-    if (depth + 1 >= MAX_BACKGROUND_DEPTH) {
+    if (depth + 1 > MAX_BACKGROUND_DEPTH) {
       return {
         error:
           `call_agent: hand-off depth limit (${MAX_BACKGROUND_DEPTH}) reached. ` +
-          `This chain of agents passing work to each other has gone as far as it may. ` +
-          `Answer with what you have instead of asking somebody else.`,
+          `This active delegation chain reached its safety limit. ` +
+          `Do not open another hand-off in this chain; report the depth-limit condition to your caller.`,
       };
     }
 

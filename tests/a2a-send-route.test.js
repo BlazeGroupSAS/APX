@@ -19,6 +19,8 @@ const { ProjectManager } = await import("#host/daemon/db.js");
 const { buildApi } = await import("#host/daemon/api.js");
 const { listCodeSessions } = await import("#core/stores/code-sessions.js");
 const { makeTempProject, cleanupTempProject } = await import("./_helpers.js");
+const { MAX_BACKGROUND_DEPTH } = await import("#core/agent/a2a/background.js");
+const { DEFAULT_A2A_JOB_TIMEOUT_S } = await import("#core/stores/background-jobs.js");
 
 /** A stand-in `opencode` that answers, reports no session of its own, and keeps
  *  the prompt it was given so a test can read what the peer actually saw. */
@@ -192,9 +194,9 @@ test("--background hands the turn back instead of holding it", async () => {
     const out = await res.json();
     assert.equal(out.reply.status, "delivering");
     assert.equal(out.reply.background, true);
-    // The detached run gets the hour a coding session can need, not the
-    // foreground's five minutes.
-    assert.equal(out.reply.timeout_s, 3600);
+    // Detached A2A gets the same twelve-hour budget as the managed job;
+    // foreground exchanges keep their five-minute default.
+    assert.equal(out.reply.timeout_s, DEFAULT_A2A_JOB_TIMEOUT_S);
     assert.equal(out.reply.text, undefined, "there is no answer yet — that is the point");
   });
 });
@@ -256,12 +258,12 @@ test("the peer's turn is told how deep the chain already is", () => {
 
 test("the route walls the chain where the tools do", async () => {
   await withApi(async ({ baseUrl, id }) => {
-    // _depth 2 means the peer would run as the third hop's successor — past the
-    // wall send_to_agent and call_agent enforce (MAX_BACKGROUND_DEPTH = 3).
-    const deep = await send(baseUrl, id, { from: "tester", to: "opencode", body: "x", deliver: true, _depth: 2 });
+    // _depth is the current parent depth. Twelve is the last active parent:
+    // trying to open child thirteen must be refused on every A2A path.
+    const deep = await send(baseUrl, id, { from: "tester", to: "opencode", body: "x", deliver: true, _depth: MAX_BACKGROUND_DEPTH });
     assert.equal(deep.status, 429);
-    assert.match((await deep.json()).error, /depth limit \(3\)/);
-    const ok = await send(baseUrl, id, { from: "tester", to: "opencode", body: "x", deliver: true, _depth: 1 });
+    assert.match((await deep.json()).error, new RegExp(`depth limit \\(${MAX_BACKGROUND_DEPTH}\\)`));
+    const ok = await send(baseUrl, id, { from: "tester", to: "opencode", body: "x", deliver: true, _depth: MAX_BACKGROUND_DEPTH - 1 });
     assert.equal(ok.status, 200);
   });
 });

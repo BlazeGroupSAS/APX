@@ -80,18 +80,18 @@ export const GROUP_TOOL_ITERS = 50;
 //
 // So a2a comes off the conversational budget for the same reason a non-Telegram
 // routine did: nobody is going to read that wrap-up, let alone answer it. It
-// does NOT get the uncapped ceiling either. replyAsAgent honours no timeoutMs
-// (only replyAsRuntime does), so there is no clock to stop a runaway and no
-// human to notice one; "run to completion" needs one or the other.
+// does NOT get the uncapped ceiling either. Native project-agent turns are
+// bounded by tool steps, while external runtime-backed turns also carry a
+// wall-clock budget. With no human watching, the finite step ceiling remains.
 //
 // Finite and generous, then — the same shape as a group speaker and, as there,
 // bounded because an exchange fans out: a chain of hand-offs is walled at
-// MAX_BACKGROUND_DEPTH (3) on every path — send_to_agent, call_agent and
+// MAX_BACKGROUND_DEPTH (12) on every path — send_to_agent, call_agent and
 // `POST /send` alike. Written out rather than aliased to
 // GROUP_TOOL_ITERS: the two numbers agree today for related but separate
 // reasons, and moving one should not silently move the other.
 //
-//   A2A_TOOL_ITERS * 4 <= WEB_TOOL_ITERS
+//   A2A_TOOL_ITERS * 13 <= WEB_TOOL_ITERS
 //
 // 20, down from 50 (2026-09-23). Fifty steps per hop let one peer burn a whole
 // usage window on a task that should have come back with a question: agents

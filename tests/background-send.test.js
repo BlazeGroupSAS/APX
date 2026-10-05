@@ -21,7 +21,7 @@ const { sendInBackground, deliverWake, wakeText, MAX_BACKGROUND_DEPTH } =
   await import("#core/agent/a2a/background.js");
 const {
   readJob, listJobs, openJob, closeJob,
-  MAX_OPEN_JOBS_PER_AGENT, BACKGROUND_JOBS_DIR,
+  MAX_OPEN_A2A_JOBS_PER_AGENT, DEFAULT_A2A_JOB_TIMEOUT_S, BACKGROUND_JOBS_DIR,
 } = await import("#core/stores/background-jobs.js");
 const { reconcileBackgroundJobs } = await import("#host/daemon/background-jobs-reconciler.js");
 
@@ -93,6 +93,8 @@ test("the sender gets its turn back immediately, while the peer is still working
   assert.match(out.note, /do NOT wait for it/i);
 
   await until(() => peer.calls.length === 1, "the peer to be called");
+  assert.equal(readJob(out.job_id).timeout_s, DEFAULT_A2A_JOB_TIMEOUT_S);
+  assert.equal(peer.calls[0].timeoutMs, DEFAULT_A2A_JOB_TIMEOUT_S * 1000);
   assert.equal(readJob(out.job_id).status, "running", "still running while the peer works");
 
   peer.answer("the MCP is not registered");
@@ -192,24 +194,24 @@ test("an agent cannot leave more than its share of work running", () => {
   const peer = peerStub();
   const args = { project, from: "ansel", to: "roby", body: "x", messagePeerFn: peer.fn };
 
-  for (let i = 0; i < MAX_OPEN_JOBS_PER_AGENT; i++) {
+  for (let i = 0; i < MAX_OPEN_A2A_JOBS_PER_AGENT; i++) {
     assert.equal(sendInBackground(args).ok, true);
   }
   const refused = sendInBackground(args);
   assert.equal(refused.ok, undefined);
   // Returned, not thrown: the model has to be able to read this and change plan.
-  assert.match(refused.error, /already have 3 jobs running/);
-  assert.match(refused.error, /limit 3/);
+  assert.match(refused.error, new RegExp(`already have ${MAX_OPEN_A2A_JOBS_PER_AGENT} jobs running`));
+  assert.match(refused.error, new RegExp(`limit ${MAX_OPEN_A2A_JOBS_PER_AGENT}`));
 });
 
 test("a chain of hand-offs stops at the depth wall", () => {
   fresh();
   const peer = peerStub();
   const refused = sendInBackground({
-    project, from: "ansel", to: "roby", body: "x", depth: MAX_BACKGROUND_DEPTH,
+    project, from: "ansel", to: "roby", body: "x", depth: MAX_BACKGROUND_DEPTH + 1,
     messagePeerFn: peer.fn,
   });
-  assert.match(refused.error, /depth limit \(3\) reached/);
+  assert.match(refused.error, new RegExp(`depth limit \\(${MAX_BACKGROUND_DEPTH}\\) reached`));
   assert.equal(listJobs().length, 0, "a refused hand-off opens no job");
 });
 
@@ -390,7 +392,7 @@ test("wake_me: false files the message and promises nothing", async () => {
 
 test("the chain is counted across turns, not restarted on every hop", async () => {
   fresh();
-  // An agent answering an a2a message that is already 3 deep may not hand it on.
+  // An agent already at the maximum active depth may not open another child.
   const deep = await handlerFor({ agentSlug: "ansel", a2aDepth: MAX_BACKGROUND_DEPTH })({
     to: "roby", message: "and you do it", background: true,
   });
@@ -428,7 +430,7 @@ test("the peer's own turn knows how deep the chain is, not just the job record",
   assert.equal(sent.depth, 2);
 
   const wake = await until(() => peer.calls[1], "the wake-up");
-  assert.equal(wake.depth, 3, "and the wake-up counts one hop further");
+  assert.equal(wake.depth, 1, "the completed child returns to its parent depth");
 });
 
 // ── The acknowledgement ping-pong (2026-09-23) ──────────────────────────────
@@ -480,10 +482,10 @@ test("the a2a etiquette of a woken turn does not claim its output goes back", as
 
 test("a blocking send hits the same depth wall as a background one", async () => {
   fresh();
-  // A woken turn runs at depth 2. It could not send in the background but
-  // could block-send, and that extra hop was the "Confirmado y registrado".
-  const out = await handlerFor({ agentSlug: "ansel", a2aDepth: 2 })({ to: "roby", message: "¿confirmás?" });
-  assert.match(out.error, /depth limit \(3\) reached/);
-  const bg = await handlerFor({ agentSlug: "ansel", a2aDepth: 2 })({ to: "roby", message: "x", background: true });
-  assert.match(bg.error, /depth limit \(3\) reached/);
+  // A turn already at the maximum active depth may not create child depth 13.
+  // Blocking and managed-background paths must enforce the same wall.
+  const out = await handlerFor({ agentSlug: "ansel", a2aDepth: MAX_BACKGROUND_DEPTH })({ to: "roby", message: "¿confirmás?" });
+  assert.match(out.error, new RegExp(`depth limit \\(${MAX_BACKGROUND_DEPTH}\\) reached`));
+  const bg = await handlerFor({ agentSlug: "ansel", a2aDepth: MAX_BACKGROUND_DEPTH })({ to: "roby", message: "x", background: true });
+  assert.match(bg.error, new RegExp(`depth limit \\(${MAX_BACKGROUND_DEPTH}\\) reached`));
 });

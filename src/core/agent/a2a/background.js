@@ -31,7 +31,7 @@
 // demands of its prompt.
 import {
   openJob, readJob, closeJob, claimWake, countOpenJobs, jobKind,
-  JOB_KINDS, MAX_OPEN_JOBS_PER_AGENT, DEFAULT_JOB_TIMEOUT_S, TERMINAL_STATUSES,
+  JOB_KINDS, MAX_OPEN_A2A_JOBS_PER_AGENT, DEFAULT_A2A_JOB_TIMEOUT_S, TERMINAL_STATUSES,
 } from "#core/stores/background-jobs.js";
 import { a2aThreadId } from "#core/stores/messages.js";
 import { emitBackgroundJobEvent } from "#core/events/bus.js";
@@ -51,7 +51,7 @@ import { readAgents } from "#core/apc/parser.js";
  * `deliverWake` below: a wake-up NEVER opens a job of its own, so a chain
  * cannot sustain itself on wake-ups alone regardless of depth.
  */
-export const MAX_BACKGROUND_DEPTH = 3;
+export const MAX_BACKGROUND_DEPTH = 12;
 
 /**
  * The wake-up message.
@@ -153,11 +153,10 @@ export async function deliverWake(job, { project, config, projects, plugins, reg
       projects,
       plugins,
       registries,
-      // The chain keeps counting across the wake-up. Without this the woken
-      // turn starts at zero and can hand the work straight back, which is the
-      // ping-pong the depth wall exists to stop — and a wake-up is exactly
-      // where it would restart, since it is a fresh turn either way.
-      depth: (Number(job.depth) || 0) + 1,
+      // A wake returns to the parent level of the active delegation chain.
+      // The completed child no longer contributes to nesting. Otherwise every
+      // request/wake cycle would grow depth forever after work had completed.
+      depth: Math.max(0, (Number(job.depth) || 0) - 1),
       // The woken turn's output is the waiter's own note, NOT a reply to the
       // peer. Filed as a reply it landed in the peer's inbox as "Recibido…",
       // the peer answered "Confirmado…", and one status report became a
@@ -265,7 +264,7 @@ export function sendInBackground({
   body,
   mode = "chat",
   wake = false,
-  timeout_s = DEFAULT_JOB_TIMEOUT_S,
+  timeout_s = DEFAULT_A2A_JOB_TIMEOUT_S,
   depth = 0,
   config,
   projects,
@@ -278,11 +277,11 @@ export function sendInBackground({
   if (!project) return { error: "background send: no project" };
   if (!from || !to) return { error: "background send: from and to are required" };
 
-  if (depth >= MAX_BACKGROUND_DEPTH) {
+  if (depth > MAX_BACKGROUND_DEPTH) {
     return {
       error:
         `background send: hand-off depth limit (${MAX_BACKGROUND_DEPTH}) reached. ` +
-        `This chain of agents handing work to each other has gone as far as it may. Do the work directly, or answer with what you have.`,
+        `This active delegation chain reached its safety limit. Do not open another hand-off in this chain; report the depth-limit condition to your caller.`,
     };
   }
 
@@ -326,11 +325,11 @@ export function sendInBackground({
   const address = peerAddress(peer);
   const sender = senderAddress(from, agents, config) || from;
 
-  const open = countOpenJobs({ project_id: project.id ?? null, from: sender });
-  if (open >= MAX_OPEN_JOBS_PER_AGENT) {
+  const open = countOpenJobs({ project_id: project.id ?? null, from: sender, kind: JOB_KINDS.A2A });
+  if (open >= MAX_OPEN_A2A_JOBS_PER_AGENT) {
     return {
       error:
-        `background send: you already have ${open} jobs running (limit ${MAX_OPEN_JOBS_PER_AGENT}). ` +
+        `background send: you already have ${open} jobs running (limit ${MAX_OPEN_A2A_JOBS_PER_AGENT}). ` +
         `Wait for one to come back before starting another — you will be woken when each finishes.`,
     };
   }
@@ -353,7 +352,20 @@ export function sendInBackground({
   // Un-awaited on purpose — this is the whole point of the module. The promise
   // is safe detached because both arms settle the job and neither rethrows.
   Promise.resolve()
-    .then(() => messagePeerFn({ project, from: sender, to: address, body, mode, config, projects, plugins, registries, depth, senderSpend }))
+    .then(() => messagePeerFn({
+      project,
+      from: sender,
+      to: address,
+      body,
+      mode,
+      config,
+      projects,
+      plugins,
+      registries,
+      timeoutMs: Number(job.timeout_s) * 1000,
+      depth,
+      senderSpend,
+    }))
     .then(
       (result) => closeJob(job.id, { status: "done", result: result?.text || "" }),
       (e) => closeJob(job.id, { status: "failed", result: e?.message || String(e) }),

@@ -121,12 +121,12 @@ export default {
     // What the sending turn had spent when it wrote this — shown on its message.
     const senderSpend = typeof turnSpend === "function" ? turnSpend() : null;
     const blockingSend = () => {
-      if (depth + 1 >= MAX_BACKGROUND_DEPTH) {
+      if (depth + 1 > MAX_BACKGROUND_DEPTH) {
         return {
           error:
             `send_to_agent: hand-off depth limit (${MAX_BACKGROUND_DEPTH}) reached. ` +
-            `This chain of agents passing work to each other has gone as far as it may. ` +
-            `Answer with what you have instead of asking somebody else.`,
+            `This active delegation chain reached its safety limit. ` +
+            `Do not open another hand-off in this chain; report the depth-limit condition to your caller.`,
         };
       }
       return messagePeer({
