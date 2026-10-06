@@ -29,8 +29,9 @@
 // gone — which is why the tool's description tells the model to put what it
 // will need into the message it sends, the same discipline `run_subagent`
 // demands of its prompt.
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  openJob, readJob, closeJob, claimWake, countOpenJobs, jobKind,
+  openJob, readJob, updateJob, closeJob, claimWake, countOpenJobs, jobKind,
   JOB_KINDS, MAX_OPEN_A2A_JOBS_PER_AGENT, DEFAULT_A2A_JOB_TIMEOUT_S, TERMINAL_STATUSES,
 } from "#core/stores/background-jobs.js";
 import { a2aThreadId } from "#core/stores/messages.js";
@@ -38,6 +39,11 @@ import { emitBackgroundJobEvent } from "#core/events/bus.js";
 import { messagePeer } from "./delegate.js";
 import { resolvePeer, peerAddress, senderAddress } from "./peers.js";
 import { readAgents } from "#core/apc/parser.js";
+
+// Carries the durable background job that owns the current A2A turn.
+// A nested send can therefore attach itself to the orchestration that spawned
+// it without polling, parsing prose, or keeping the caller's turn alive.
+const managedBackgroundContext = new AsyncLocalStorage();
 
 /**
  * How deep a chain of background hand-offs may go.
@@ -141,7 +147,9 @@ export async function deliverWake(job, { project, config, projects, plugins, reg
   if (!claimWake(job.id)) return { delivered: false, reason: "already delivered" };
 
   try {
-    await messagePeerFn({
+    const result = await managedBackgroundContext.run(
+      job.parent_job_id || null,
+      () => messagePeerFn({
       project,
       // Reversed on purpose: the one who WORKED is now the one writing, so the
       // wake-up lands in the same thread as the request and reads as its reply.
@@ -163,7 +171,47 @@ export async function deliverWake(job, { project, config, projects, plugins, reg
       // four-message ping-pong of full tool loops (2026-09-23: ~230 a2a
       // messages in 50 minutes, most of them acknowledgements).
       wakeFor: job.id,
-    });
+    }),
+    );
+
+    // A child wake resumes the manager that owns the OUTER background job.
+    //
+    // If that resumed manager delegated another managed child, sendInBackground
+    // already replaced waiting_on_job_id synchronously, so the outer job stays
+    // open. If it did not, this wake completed the orchestration level and the
+    // outer job can now settle and wake its own caller.
+    if (job.parent_job_id) {
+      const parent = readJob(job.parent_job_id);
+
+      if (
+        parent &&
+        !TERMINAL_STATUSES.includes(parent.status) &&
+        parent.waiting_on_job_id === job.id
+      ) {
+        updateJob(parent.id, { waiting_on_job_id: null });
+
+        const settledParent = closeJob(parent.id, {
+          status: "done",
+          result: result?.text || "",
+        });
+
+        if (settledParent) {
+          emitBackgroundJobEvent({ phase: "end", job: settledParent });
+
+          if (settledParent.wake) {
+            await deliverWake(settledParent, {
+              project,
+              config,
+              projects,
+              plugins,
+              registries,
+              messagePeerFn,
+            });
+          }
+        }
+      }
+    }
+
     return { delivered: true };
   } catch (e) {
     // The waiter did not wake. Say so where it can be seen rather than
@@ -334,6 +382,12 @@ export function sendInBackground({
     };
   }
 
+  // When this send happens inside a background-managed A2A turn, the new job
+  // belongs to that outer orchestration. Only wake-managed children suspend the
+  // parent; fire-and-forget work must not hold somebody else's completion open.
+  const managedParentJobId =
+    wake ? (managedBackgroundContext.getStore() || null) : null;
+
   const job = openJob({
     project_id: project.id ?? null,
     from: sender,
@@ -343,7 +397,20 @@ export function sendInBackground({
     wake,
     timeout_s,
     depth,
+    parent_job_id: managedParentJobId,
   });
+
+  // Link the parent BEFORE starting the child. This ordering is deliberate:
+  // a very fast child must never be able to finish before the parent knows that
+  // its orchestration is suspended on that child.
+  if (job.parent_job_id) {
+    const parent = readJob(job.parent_job_id);
+
+    if (parent && !TERMINAL_STATUSES.includes(parent.status)) {
+      updateJob(parent.id, { waiting_on_job_id: job.id });
+    }
+  }
+
   // Announced so a panel can show the agent working on something while its turn
   // carries on. Core emits and never listens (rule 8); the daemon's events-ws
   // bridge is what turns this into a frame.
@@ -352,7 +419,9 @@ export function sendInBackground({
   // Un-awaited on purpose — this is the whole point of the module. The promise
   // is safe detached because both arms settle the job and neither rethrows.
   Promise.resolve()
-    .then(() => messagePeerFn({
+    .then(() => managedBackgroundContext.run(
+      job.id,
+      () => messagePeerFn({
       project,
       from: sender,
       to: address,
@@ -365,10 +434,45 @@ export function sendInBackground({
       timeoutMs: Number(job.timeout_s) * 1000,
       depth,
       senderSpend,
-    }))
+    }),
+    ))
     .then(
-      (result) => closeJob(job.id, { status: "done", result: result?.text || "" }),
-      (e) => closeJob(job.id, { status: "failed", result: e?.message || String(e) }),
+      (result) => {
+        const current = readJob(job.id);
+
+        if (!current || TERMINAL_STATUSES.includes(current.status)) {
+          return null;
+        }
+
+        // Returning from the manager's current turn is NOT completion when that
+        // turn handed ownership onward to a managed child.
+        if (current.waiting_on_job_id) {
+          return null;
+        }
+
+        return closeJob(job.id, {
+          status: "done",
+          result: result?.text || "",
+        });
+      },
+      (e) => {
+        const current = readJob(job.id);
+
+        if (!current || TERMINAL_STATUSES.includes(current.status)) {
+          return null;
+        }
+
+        // Same rule on the rejection path: once durable child work owns the
+        // orchestration, unwinding the spawning turn must not falsely close it.
+        if (current.waiting_on_job_id) {
+          return null;
+        }
+
+        return closeJob(job.id, {
+          status: "failed",
+          result: e?.message || String(e),
+        });
+      },
     )
     .then(async (settled) => {
       if (!settled) return;

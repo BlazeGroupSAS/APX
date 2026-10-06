@@ -129,6 +129,7 @@ export function openJob({
   wake = false,
   timeout_s = DEFAULT_JOB_TIMEOUT_S,
   depth = 0,
+  parent_job_id = null,
   kind = JOB_KINDS.A2A,
   // Shell jobs only. `command`/`cwd` are what was run and where; `pid` is the
   // process GROUP leader, so cancelling can signal the whole tree rather than
@@ -163,6 +164,13 @@ export function openJob({
     body: String(body || "").slice(0, 2000),
     wake: !!wake,
     depth: Number(depth) || 0,
+    ...(kind === JOB_KINDS.A2A
+      ? {
+        parent_job_id:
+          parent_job_id == null ? null : String(parent_job_id),
+        waiting_on_job_id: null,
+      }
+      : {}),
     status: "running",
     daemon_pid: process.pid,
     created_at: created.toISOString(),
@@ -235,6 +243,12 @@ export function updateJob(id, patch = {}) {
   const next = { ...job };
   if (patch.pid !== undefined) next.pid = patch.pid == null ? null : Number(patch.pid);
   if (patch.tail !== undefined) next.tail = String(patch.tail || "");
+  if (patch.waiting_on_job_id !== undefined) {
+    next.waiting_on_job_id =
+      patch.waiting_on_job_id == null
+        ? null
+        : String(patch.waiting_on_job_id);
+  }
   writeJson(fileFor(id), next);
   return next;
 }

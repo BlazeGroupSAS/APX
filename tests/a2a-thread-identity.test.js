@@ -27,7 +27,11 @@ process.env.APX_HOME = path.join(TMP_HOME, ".apx");
 const { test } = await import("node:test");
 const { default: assert } = await import("node:assert/strict");
 const { a2aThreadId } = await import("#core/stores/messages.js");
-const { readJob, BACKGROUND_JOBS_DIR } = await import("#core/stores/background-jobs.js");
+const {
+  readJob,
+  BACKGROUND_JOBS_DIR,
+  MAX_OPEN_A2A_JOBS_PER_AGENT,
+} = await import("#core/stores/background-jobs.js");
 const { sendInBackground } = await import("#core/agent/a2a/background.js");
 
 /** A project on disk with two agents whose names are not their slugs — which is
@@ -103,12 +107,31 @@ test("the fan-out wall counts the sender's own jobs", async () => {
   // MIXED SPELLINGS on purpose — the same agent, named three ways. Unresolved,
   // these are three different senders with one job each and the wall never
   // closes.
-  assert.equal(open("cfo").ok, true);
-  assert.equal(open("Blake").ok, true);
-  assert.equal(open("blake").ok, true);
-  const fourth = open("Blake");
-  assert.ok(fourth.error, "the fourth is refused, however it spells itself");
-  assert.match(fourth.error, /already have 3 jobs running/);
+  const spellings = ["cfo", "Blake", "blake"];
+
+  for (let i = 0; i < MAX_OPEN_A2A_JOBS_PER_AGENT; i++) {
+    const out = open(spellings[i % spellings.length]);
+
+    assert.equal(
+      out.ok,
+      true,
+      `job ${i + 1} should be allowed below the fan-out wall`,
+    );
+  }
+
+  const refused = open("Blake");
+
+  assert.ok(
+    refused.error,
+    `job ${MAX_OPEN_A2A_JOBS_PER_AGENT + 1} is refused however the sender spells itself`,
+  );
+
+  assert.match(
+    refused.error,
+    new RegExp(
+      `already have ${MAX_OPEN_A2A_JOBS_PER_AGENT} jobs running`
+    ),
+  );
 });
 
 test("messagePeer canonicalises both ends, not just the recipient", () => {

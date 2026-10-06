@@ -489,3 +489,477 @@ test("a blocking send hits the same depth wall as a background one", async () =>
   const bg = await handlerFor({ agentSlug: "ansel", a2aDepth: MAX_BACKGROUND_DEPTH })({ to: "roby", message: "x", background: true });
   assert.match(bg.error, new RegExp(`depth limit \\(${MAX_BACKGROUND_DEPTH}\\) reached`));
 });
+
+
+test("nested managed background keeps the outer job open until the manager's resumed turn is terminal", async () => {
+  fresh();
+
+  const chainRoot = makeTempProject({
+    name: "nested-managed-wake",
+    agents: [
+      { slug: "charly", role: "Super Agent" },
+      { slug: "napoleon", role: "Manager" },
+      { slug: "devincci", role: "Implementer" },
+    ],
+  });
+
+  const chainProject = {
+    id: 77,
+    path: chainRoot,
+    storagePath: "/tmp/nested-managed-wake-store",
+    name: "nested-managed-wake",
+    config: {},
+  };
+
+  const calls = [];
+
+  let childJobId = null;
+  let releaseChild;
+
+  const childGate = new Promise((resolve) => {
+    releaseChild = resolve;
+  });
+
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+
+    // Charly starts the outer background job against Napoleon.
+    // Napoleon delegates once, then deliberately ends its turn waiting for
+    // Devincci's managed wake.
+    if (
+      args.from === "charly" &&
+      args.to === "napoleon" &&
+      !args.wakeFor
+    ) {
+      const child = sendInBackground({
+        project: chainProject,
+        from: "napoleon",
+        to: "devincci",
+        body: "implement the fix",
+        wake: true,
+        depth: 1,
+        messagePeerFn,
+      });
+
+      assert.equal(child.ok, true);
+      childJobId = child.job_id;
+
+      return {
+        text: "Delegated to Devincci; waiting for managed wake.",
+        thread: "charly~napoleon",
+        trace: [
+          {
+            tool: "send_to_agent",
+            result: {
+              ok: true,
+              job_id: child.job_id,
+              status: "running",
+              wake: true,
+            },
+          },
+        ],
+      };
+    }
+
+    // Devincci is still working.
+    if (
+      args.from === "napoleon" &&
+      args.to === "devincci" &&
+      !args.wakeFor
+    ) {
+      return childGate;
+    }
+
+    // Devincci finished: this managed wake resumes Napoleon.
+    // Napoleon now returns a genuinely terminal orchestration result.
+    if (
+      args.from === "devincci" &&
+      args.to === "napoleon" &&
+      args.wakeFor === childJobId
+    ) {
+      return {
+        text: "DONE: implementation verified",
+        thread: "napoleon~devincci",
+        trace: [],
+      };
+    }
+
+    // Only after Napoleon's resumed turn is terminal may the OUTER job wake
+    // Charly.
+    if (
+      args.from === "napoleon" &&
+      args.to === "charly" &&
+      args.wakeFor
+    ) {
+      return {
+        text: "ack",
+        thread: "charly~napoleon",
+        trace: [],
+      };
+    }
+
+    return {
+      text: "ack",
+      thread: "t",
+      trace: [],
+    };
+  };
+
+  const parent = sendInBackground({
+    project: chainProject,
+    from: "charly",
+    to: "napoleon",
+    body: "own this task through implementation and verification",
+    wake: true,
+    depth: 0,
+    messagePeerFn,
+  });
+
+  assert.equal(parent.ok, true);
+
+  await until(
+    () => childJobId && readJob(childJobId),
+    "Napoleon to create the managed child job",
+  );
+
+  await until(
+    () => calls.some(
+      (c) =>
+        c.from === "napoleon" &&
+        c.to === "devincci" &&
+        !c.wakeFor
+    ),
+    "Devincci to start working",
+  );
+
+  // THIS is the regression:
+  // Napoleon's first A2A turn returned, but the orchestration is not terminal.
+  // The Charly -> Napoleon job must remain open.
+  const suspendedParent = readJob(parent.job_id);
+
+  assert.equal(
+    suspendedParent.status,
+    "running",
+    "outer job must stay running while Napoleon waits on a managed child wake",
+  );
+
+  assert.equal(
+    suspendedParent.waiting_on_job_id,
+    childJobId,
+    "outer job must durably record which managed child currently owns progress",
+  );
+
+  assert.equal(
+    calls.filter(
+      (c) =>
+        c.from === "napoleon" &&
+        c.to === "charly" &&
+        c.wakeFor === parent.job_id
+    ).length,
+    0,
+    "Charly must not be woken by Napoleon's intermediate waiting turn",
+  );
+
+  // Devincci finishes.
+  releaseChild({
+    text: "IMPLEMENTED",
+    thread: "napoleon~devincci",
+    trace: [],
+  });
+
+  await until(
+    () => readJob(childJobId)?.status === "done",
+    "the Devincci child job to finish",
+  );
+
+  // Its managed wake resumes Napoleon. Napoleon returns terminal DONE, so only
+  // NOW may the outer job settle.
+  await until(
+    () => readJob(parent.job_id)?.status === "done",
+    "the outer Charly to Napoleon job to finish after Napoleon resumes",
+  );
+
+  const finalParent = readJob(parent.job_id);
+
+  assert.match(
+    finalParent.result,
+    /DONE: implementation verified/,
+    "the outer job result must be Napoleon's resumed terminal result",
+  );
+
+  const parentWakes = calls.filter(
+    (c) =>
+      c.from === "napoleon" &&
+      c.to === "charly" &&
+      c.wakeFor === parent.job_id
+  );
+
+  assert.equal(
+    parentWakes.length,
+    1,
+    "Charly must receive exactly one final managed wake",
+  );
+});
+
+
+test("nested managed background can hand off implementer to auditor before waking the outer caller", async () => {
+  fresh();
+
+  const chainRoot = makeTempProject({
+    name: "nested-managed-two-stage",
+    agents: [
+      { slug: "charly", role: "Super Agent" },
+      { slug: "napoleon", role: "Manager" },
+      { slug: "devincci", role: "Implementer" },
+      { slug: "claupernico", role: "Auditor" },
+    ],
+  });
+
+  const chainProject = {
+    id: 78,
+    path: chainRoot,
+    storagePath: "/tmp/nested-managed-two-stage-store",
+    name: "nested-managed-two-stage",
+    config: {},
+  };
+
+  const calls = [];
+
+  let implementerJobId = null;
+  let auditorJobId = null;
+
+  let releaseImplementer;
+  let releaseAuditor;
+
+  const implementerGate = new Promise((resolve) => {
+    releaseImplementer = resolve;
+  });
+
+  const auditorGate = new Promise((resolve) => {
+    releaseAuditor = resolve;
+  });
+
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+
+    // Charly gives Napoleon ownership of the whole orchestration.
+    if (
+      args.from === "charly" &&
+      args.to === "napoleon" &&
+      !args.wakeFor
+    ) {
+      const child = sendInBackground({
+        project: chainProject,
+        from: "napoleon",
+        to: "devincci",
+        body: "implement the requested change",
+        wake: true,
+        depth: 1,
+        messagePeerFn,
+      });
+
+      assert.equal(child.ok, true);
+      implementerJobId = child.job_id;
+
+      return {
+        text: "Implementation delegated; waiting for managed wake.",
+        thread: "charly~napoleon",
+        trace: [],
+      };
+    }
+
+    // Devincci remains working until the test releases it.
+    if (
+      args.from === "napoleon" &&
+      args.to === "devincci" &&
+      !args.wakeFor
+    ) {
+      return implementerGate;
+    }
+
+    // First wake: implementation completed. Napoleon now delegates audit.
+    if (
+      args.from === "devincci" &&
+      args.to === "napoleon" &&
+      args.wakeFor === implementerJobId
+    ) {
+      const audit = sendInBackground({
+        project: chainProject,
+        from: "napoleon",
+        to: "claupernico",
+        body: "audit the implementation independently",
+        wake: true,
+        depth: 1,
+        messagePeerFn,
+      });
+
+      assert.equal(audit.ok, true);
+      auditorJobId = audit.job_id;
+
+      return {
+        text: "Implementation received; audit delegated.",
+        thread: "napoleon~devincci",
+        trace: [],
+      };
+    }
+
+    // Claupernico remains working until released.
+    if (
+      args.from === "napoleon" &&
+      args.to === "claupernico" &&
+      !args.wakeFor
+    ) {
+      return auditorGate;
+    }
+
+    // Second wake: audit completed. Napoleon is now genuinely terminal.
+    if (
+      args.from === "claupernico" &&
+      args.to === "napoleon" &&
+      args.wakeFor === auditorJobId
+    ) {
+      return {
+        text: "DONE: implementation verified independently",
+        thread: "napoleon~claupernico",
+        trace: [],
+      };
+    }
+
+    // Only this final outer wake may reach Charly.
+    if (
+      args.from === "napoleon" &&
+      args.to === "charly" &&
+      args.wakeFor
+    ) {
+      return {
+        text: "ack",
+        thread: "charly~napoleon",
+        trace: [],
+      };
+    }
+
+    return {
+      text: "ack",
+      thread: "t",
+      trace: [],
+    };
+  };
+
+  const parent = sendInBackground({
+    project: chainProject,
+    from: "charly",
+    to: "napoleon",
+    body: "implement, audit, and return only the final result",
+    wake: true,
+    depth: 0,
+    messagePeerFn,
+  });
+
+  assert.equal(parent.ok, true);
+
+  await until(
+    () => implementerJobId && readJob(implementerJobId),
+    "Napoleon to create the implementer job",
+  );
+
+  let parentState = readJob(parent.job_id);
+
+  assert.equal(parentState.status, "running");
+  assert.equal(parentState.waiting_on_job_id, implementerJobId);
+
+  assert.equal(
+    calls.filter(
+      (c) =>
+        c.from === "napoleon" &&
+        c.to === "charly" &&
+        c.wakeFor === parent.job_id
+    ).length,
+    0,
+    "Charly must not wake while implementation is pending",
+  );
+
+  // Stage 1 completes.
+  releaseImplementer({
+    text: "IMPLEMENTED",
+    thread: "napoleon~devincci",
+    trace: [],
+  });
+
+  await until(
+    () => auditorJobId && readJob(auditorJobId),
+    "Napoleon to create the auditor job after implementer wake",
+  );
+
+  await until(
+    () => readJob(implementerJobId)?.status === "done",
+    "implementer job to finish",
+  );
+
+  parentState = readJob(parent.job_id);
+
+  assert.equal(
+    parentState.status,
+    "running",
+    "outer job must remain running while audit is pending",
+  );
+
+  assert.equal(
+    parentState.waiting_on_job_id,
+    auditorJobId,
+    "outer ownership must move from implementer job to auditor job",
+  );
+
+  assert.notEqual(
+    parentState.waiting_on_job_id,
+    implementerJobId,
+    "the completed implementer must no longer own progress",
+  );
+
+  assert.equal(
+    calls.filter(
+      (c) =>
+        c.from === "napoleon" &&
+        c.to === "charly" &&
+        c.wakeFor === parent.job_id
+    ).length,
+    0,
+    "Charly must still not wake between implementation and audit",
+  );
+
+  // Stage 2 completes.
+  releaseAuditor({
+    text: "PASS",
+    thread: "napoleon~claupernico",
+    trace: [],
+  });
+
+  await until(
+    () => readJob(auditorJobId)?.status === "done",
+    "auditor job to finish",
+  );
+
+  await until(
+    () => readJob(parent.job_id)?.status === "done",
+    "outer orchestration to finish after audit wake",
+  );
+
+  const finalParent = readJob(parent.job_id);
+
+  assert.match(
+    finalParent.result,
+    /DONE: implementation verified independently/,
+  );
+
+  const parentWakes = calls.filter(
+    (c) =>
+      c.from === "napoleon" &&
+      c.to === "charly" &&
+      c.wakeFor === parent.job_id
+  );
+
+  assert.equal(
+    parentWakes.length,
+    1,
+    "Charly must receive exactly one wake after the whole orchestration",
+  );
+});
