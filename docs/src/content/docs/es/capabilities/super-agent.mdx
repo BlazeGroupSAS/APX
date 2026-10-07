@@ -162,6 +162,13 @@ respuesta llega como un mensaje nuevo en el mismo hilo agente-a-agente y arranca
 un turno fresco con el resultado en la mano. Pasá `wake_me: false` para un aviso
 puro, del que nunca vas a necesitar respuesta.
 
+Los comandos en segundo plano lanzados con `run_shell` siguen el mismo lifecycle
+managed dentro de una gestión agente-a-agente. Cada comando wakeable mantiene
+abierta la delegación propietaria hasta que su resultado reanuda al agente; puede
+haber varios pendientes a la vez, y el llamador original se despierta recién
+cuando termina la última dependencia managed. Un comando con `wake_me: false`
+sigue siendo independiente y nunca demora esa gestión.
+
 El despertar es un mensaje a2a común en sentido inverso, así que el pedido y su
 respuesta viven en un solo hilo — no hay un lugar nuevo adonde mirar.
 

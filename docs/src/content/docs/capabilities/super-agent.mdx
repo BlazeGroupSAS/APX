@@ -162,6 +162,13 @@ arrives as a new message on the same agent-to-agent thread, starting a fresh tur
 with the result in hand. Pass `wake_me: false` for a pure notification nobody
 needs an answer to.
 
+Background commands launched with `run_shell` follow the same managed lifecycle
+inside an agent-to-agent orchestration. Every wakeable command keeps the owning
+delegation open until its result has resumed the agent; several commands may be
+pending together, and the original caller is woken only after the last managed
+dependency has completed. A command launched with `wake_me: false` remains
+independent and never delays that orchestration.
+
 The wake-up is an ordinary a2a message in the other direction, so the request and
 its answer live in one thread — there is nowhere new to look.
 

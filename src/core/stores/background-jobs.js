@@ -164,11 +164,13 @@ export function openJob({
     body: String(body || "").slice(0, 2000),
     wake: !!wake,
     depth: Number(depth) || 0,
+    parent_job_id:
+      parent_job_id == null ? null : String(parent_job_id),
     ...(kind === JOB_KINDS.A2A
       ? {
-        parent_job_id:
-          parent_job_id == null ? null : String(parent_job_id),
         waiting_on_job_id: null,
+        managed_dependency_ids: [],
+        managed_dependency_failures: [],
       }
       : {}),
     status: "running",
@@ -248,6 +250,19 @@ export function updateJob(id, patch = {}) {
       patch.waiting_on_job_id == null
         ? null
         : String(patch.waiting_on_job_id);
+  }
+  if (patch.managed_dependency_ids !== undefined) {
+    next.managed_dependency_ids = Array.isArray(patch.managed_dependency_ids)
+      ? [...new Set(patch.managed_dependency_ids.map(String))]
+      : [];
+  }
+  if (patch.managed_dependency_failures !== undefined) {
+    next.managed_dependency_failures = Array.isArray(patch.managed_dependency_failures)
+      ? patch.managed_dependency_failures.map((entry) => ({
+        job_id: String(entry?.job_id || ""),
+        reason: String(entry?.reason || "").slice(0, 2000),
+      })).filter((entry) => entry.job_id)
+      : [];
   }
   writeJson(fileFor(id), next);
   return next;

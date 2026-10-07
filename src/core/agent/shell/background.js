@@ -42,6 +42,9 @@ import {
   JOB_KINDS, MAX_OPEN_JOBS_PER_AGENT, DEFAULT_JOB_TIMEOUT_S, TERMINAL_STATUSES,
 } from "#core/stores/background-jobs.js";
 import { emitBackgroundJobEvent } from "#core/events/bus.js";
+import {
+  attachManagedDependency, managedParentJobId,
+} from "#core/agent/managed-background.js";
 
 /** The longest a background command may run. Six hours: long enough for a batch
  *  render nobody wants to babysit, short enough that a hung process is reaped
@@ -189,6 +192,7 @@ export function runShellInBackground({
   }
 
   const ttl = Math.max(1, Math.min(Number(timeout_s) > 0 ? Number(timeout_s) : DEFAULT_JOB_TIMEOUT_S, MAX_SHELL_JOB_TIMEOUT_S));
+  const managedParentId = managedParentJobId(wake);
   const job = openJob({
     project_id: project.id ?? null,
     kind: JOB_KINDS.SHELL,
@@ -201,7 +205,11 @@ export function runShellInBackground({
     wake: !!wake,
     timeout_s: ttl,
     origin,
+    parent_job_id: managedParentId,
   });
+
+  // Durable before spawn: a command may emit close in the same tick.
+  if (job.parent_job_id) attachManagedDependency(job.parent_job_id, job.id);
 
   const logPath = jobLogPath(job.id);
   let log = null;

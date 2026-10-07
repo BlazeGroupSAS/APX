@@ -24,9 +24,13 @@
 // Exactly-once is `claimWake`'s, not this module's: an atomic `open(…, "wx")`
 // that returns true for one caller ever. See its header for why waking twice is
 // the failure worth spending a syscall on.
-import { onBackgroundJobEvent } from "#core/events/bus.js";
+import { emitBackgroundJobEvent, onBackgroundJobEvent } from "#core/events/bus.js";
 import { claimWake, jobKind, JOB_KINDS } from "#core/stores/background-jobs.js";
 import { shellWakeText } from "#core/agent/shell/background.js";
+import { deliverWake } from "#core/agent/a2a/background.js";
+import {
+  runInManagedBackground, settleManagedDependency,
+} from "#core/agent/managed-background.js";
 import { readAgents } from "#core/apc/parser.js";
 import { resolveAgentModel } from "#core/agent/agent-model.js";
 import { CHANNELS } from "#core/constants/channels.js";
@@ -76,12 +80,49 @@ async function waitForQuietChat(projectId, conversationId, log) {
   if (waited) log?.(`shell-job-wake: waited for ${conversationId} to be free`);
 }
 
+async function settleManagedShellDependency(job, {
+  result = "",
+  failure = null,
+  project = null,
+  config,
+  projects,
+  plugins,
+  registries,
+  messagePeerFn,
+  log,
+} = {}) {
+  if (!job?.parent_job_id) return null;
+  const { settled } = settleManagedDependency({
+    parentJobId: job.parent_job_id,
+    childJobId: job.id,
+    result,
+    failure,
+  });
+  if (!settled) return null;
+
+  emitBackgroundJobEvent({ phase: "end", job: settled });
+  if (!settled.wake || !project) return settled;
+
+  const delivered = await deliverWake(settled, {
+    project,
+    config: project.config || config,
+    projects,
+    plugins,
+    registries,
+    messagePeerFn,
+  });
+  if (!delivered.delivered && delivered.reason !== "already delivered") {
+    log?.(`shell-job-wake: managed parent ${settled.id} wake not delivered — ${delivered.reason}`);
+  }
+  return settled;
+}
+
 /**
  * Wake the agent that left this job running. Never throws — it is called from an
  * event listener, and an unhandled rejection here would take the daemon with it.
  */
 export async function wakeShellJob(job, {
-  projects, config, plugins, registries, log,
+  projects, config, plugins, registries, log, messagePeerFn,
   // Injected the way `replyAsAgent` takes `runAgentTurnFn`: this function's job
   // is deciding WHO is woken, WHERE, and exactly once — all three worth
   // asserting without standing up an engine to answer the wake-up.
@@ -97,6 +138,9 @@ export async function wakeShellJob(job, {
   const project = projects?.get?.(job.project_id);
   if (!project) {
     log?.(`shell-job-wake: cannot wake ${job.from} for ${job.id} — project ${job.project_id} is gone`);
+    await settleManagedShellDependency(job, {
+      failure: `project ${job.project_id} is gone`, projects, config, plugins, registries, messagePeerFn, log,
+    });
     return { woken: false, reason: "project gone" };
   }
 
@@ -106,12 +150,18 @@ export async function wakeShellJob(job, {
   } catch { /* an unreadable roster is the same as a missing agent */ }
   if (!agent) {
     log?.(`shell-job-wake: cannot wake ${job.from} for ${job.id} — no such agent in ${project.id}`);
+    await settleManagedShellDependency(job, {
+      failure: `agent ${job.from} is gone`, project, projects, config, plugins, registries, messagePeerFn, log,
+    });
     return { woken: false, reason: "agent gone" };
   }
 
   const modelId = await resolveAgentModel({ agent, config: project.config || config, autonomous: true });
   if (!modelId) {
     log?.(`shell-job-wake: cannot wake ${job.from} for ${job.id} — the agent has no model`);
+    await settleManagedShellDependency(job, {
+      failure: `agent ${job.from} has no model`, project, projects, config, plugins, registries, messagePeerFn, log,
+    });
     return { woken: false, reason: "no model" };
   }
 
@@ -135,7 +185,7 @@ export async function wakeShellJob(job, {
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
   try {
-    const out = await runChatTurnFn({
+    const out = await runInManagedBackground(job.parent_job_id || null, () => runChatTurnFn({
       p: project,
       agent,
       modelId,
@@ -163,6 +213,16 @@ export async function wakeShellJob(job, {
       projects,
       plugins,
       registries,
+    }));
+    await settleManagedShellDependency(job, {
+      result: out?.text || "",
+      project,
+      config,
+      projects,
+      plugins,
+      registries,
+      messagePeerFn,
+      log,
     });
     log?.(`shell-job-wake: woke ${job.from} for ${job.id} in ${out.conversation_id}`);
     return { woken: true, conversation_id: out.conversation_id };
@@ -180,13 +240,23 @@ export async function wakeShellJob(job, {
     log?.(`shell-job-wake: wake for ${job.id} failed — ${e?.message || e}`);
   }
   }
+  await settleManagedShellDependency(job, {
+    failure: lastError?.message || String(lastError),
+    project,
+    config,
+    projects,
+    plugins,
+    registries,
+    messagePeerFn,
+    log,
+  });
   return { woken: false, reason: lastError?.message || String(lastError) };
 }
 
 /**
  * Start listening. Returns `{ stop }`, like the reconcilers.
  */
-export function startShellJobWake({ projects, config, plugins, registries, log, runChatTurnFn } = {}) {
+export function startShellJobWake({ projects, config, plugins, registries, log, runChatTurnFn, messagePeerFn } = {}) {
   const unsubscribe = onBackgroundJobEvent((event) => {
     if (event?.phase !== "end") return;
     const job = event.job;
@@ -195,7 +265,7 @@ export function startShellJobWake({ projects, config, plugins, registries, log, 
     // chats at once is still one agent taking two turns, and the second one
     // would read a memory the first is in the middle of writing.
     enqueue(`${job.project_id}:${job.from}`, () =>
-      wakeShellJob(job, { projects, config, plugins, registries, log, runChatTurnFn }));
+      wakeShellJob(job, { projects, config, plugins, registries, log, runChatTurnFn, messagePeerFn }));
   });
   return { stop: unsubscribe };
 }
