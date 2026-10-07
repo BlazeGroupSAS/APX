@@ -29,8 +29,8 @@ import { claimWake, jobKind, JOB_KINDS } from "#core/stores/background-jobs.js";
 import { shellWakeText } from "#core/agent/shell/background.js";
 import { deliverWake } from "#core/agent/a2a/background.js";
 import {
-  beginManagedContinuation, completeManagedTurn, runInManagedBackground,
-  settleManagedDependency,
+  beginManagedContinuation, completeManagedTurn, releaseManagedTurnOwnership,
+  runInManagedBackground, settleManagedDependency,
 } from "#core/agent/managed-background.js";
 import { readAgents } from "#core/apc/parser.js";
 import { resolveAgentModel } from "#core/agent/agent-model.js";
@@ -92,21 +92,30 @@ async function settleManagedShellDependency(job, {
   registries,
   messagePeerFn,
   log,
+  settleManagedDependencyFn = settleManagedDependency,
 } = {}) {
   if (!job?.parent_job_id) return null;
-  const released = settleManagedDependency({
-    parentJobId: job.parent_job_id,
-    childJobId: job.id,
-    failure,
-  });
-  const completed = completeTurn
-    ? completeManagedTurn({
+  let completed = { settled: null };
+  let released = { settled: null };
+  try {
+    // Persist the turn outcome first. If releasing the dependency then fails,
+    // the durable parent is non-active and cannot strand an in-memory waiter.
+    completed = completeTurn
+      ? completeManagedTurn({
+        parentJobId: job.parent_job_id,
+        status: failure ? "failed" : "done",
+        result: failure || result,
+      })
+      : completed;
+    released = settleManagedDependencyFn({
       parentJobId: job.parent_job_id,
-      status: failure ? "failed" : "done",
-      result: failure || result,
-    })
-    : { settled: null };
-  const settled = completed.settled || released.settled;
+      childJobId: job.id,
+      failure,
+    });
+  } finally {
+    if (completeTurn) releaseManagedTurnOwnership(job.parent_job_id);
+  }
+  const settled = released.settled || completed.settled;
   if (!settled) return null;
 
   emitBackgroundJobEvent({ phase: "end", job: settled });
@@ -137,6 +146,7 @@ async function wakeShellJobImpl(job, {
   // asserting without standing up an engine to answer the wake-up.
   runChatTurnFn = runChatTurn,
   settleManagedFn = settleManagedShellDependency,
+  settleManagedDependencyFn = settleManagedDependency,
   // How long to wait before the second attempt. Injectable for the same reason
   // runChatTurnFn is: the retry is behaviour worth asserting, and a test that
   // asserts it should not pay two real seconds for the privilege — nor await an
@@ -266,6 +276,7 @@ async function wakeShellJobImpl(job, {
       result: out?.text || "",
       failure: wakeFailure,
       completeTurn: !!job.parent_job_id,
+      settleManagedDependencyFn,
       project, config, projects, plugins, registries, messagePeerFn, log,
     });
   } catch (e) {
@@ -306,10 +317,12 @@ export function startShellJobWake({ projects, config, plugins, registries, log, 
     if (event?.phase !== "end") return;
     const job = event.job;
     if (!job || jobKind(job) !== JOB_KINDS.SHELL || !job.wake) return;
-    // Serialised per agent rather than per conversation: an agent woken in two
-    // chats at once is still one agent taking two turns, and the second one
-    // would read a memory the first is in the middle of writing.
-    enqueue(`${job.project_id}:${job.from}`, () =>
+    // A managed owner may be live for minutes, so only its own continuations
+    // share a queue. Independent wakes retain the existing per-agent ordering.
+    const queueKey = job.parent_job_id
+      ? `managed:${job.project_id}:${job.parent_job_id}`
+      : `agent:${job.project_id}:${job.from}`;
+    enqueue(queueKey, () =>
       wakeShellJob(job, { projects, config, plugins, registries, log, runChatTurnFn, messagePeerFn }));
   });
   return { stop: unsubscribe };

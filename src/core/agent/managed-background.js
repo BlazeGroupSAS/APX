@@ -26,6 +26,11 @@ function releaseLatch(jobId) {
   latch.resolve();
 }
 
+/** Release only in-memory ownership; durable lifecycle state is persisted separately. */
+export function releaseManagedTurnOwnership(jobId) {
+  if (jobId) releaseLatch(jobId);
+}
+
 async function withContinuationLock(jobId, fn) {
   const key = String(jobId);
   const previous = continuationLocks.get(key) || Promise.resolve();
