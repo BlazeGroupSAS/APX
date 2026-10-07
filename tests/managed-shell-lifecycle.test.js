@@ -12,7 +12,10 @@ process.env.APX_HOME = path.join(TMP_HOME, ".apx");
 const { test } = await import("node:test");
 const { default: assert } = await import("node:assert/strict");
 const { makeTempProject } = await import("./_helpers.js");
-const { sendInBackground } = await import("#core/agent/a2a/background.js");
+const {
+  cancelJob, MAX_BACKGROUND_DEPTH, sendInBackground,
+} = await import("#core/agent/a2a/background.js");
+const sendToAgent = (await import("#core/agent/tools/handlers/send-to-agent.js")).default;
 const { runShellInBackground } = await import("#core/agent/shell/background.js");
 const {
   BACKGROUND_JOBS_DIR, closeJob, readJob, wakeClaimed,
@@ -53,7 +56,13 @@ function fakeChild() {
   return child;
 }
 
-function launchShell({ from, command = "echo managed", wake = true }) {
+function launchShell({
+  from,
+  command = "echo managed",
+  wake = true,
+  depth = 0,
+  origin = { channel: "web", conversation_id: `${from}-chat` },
+}) {
   const child = fakeChild();
   const launched = runShellInBackground({
     project: PROJECT,
@@ -61,11 +70,19 @@ function launchShell({ from, command = "echo managed", wake = true }) {
     command,
     cwd: ROOT,
     wake,
-    origin: { channel: "web", conversation_id: `${from}-chat` },
+    depth,
+    origin,
     spawnFn: () => child,
     shellCommandFn: (text) => ({ file: "test-shell", args: [text], options: {} }),
   });
   return { child, launched };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
 }
 
 async function until(check, what, tries = 300) {
@@ -348,4 +365,243 @@ test("a definitive managed shell wake failure fails and releases the parent once
   assert.equal(duplicate.woken, false);
   assert.match(duplicate.reason, /already delivered/);
   assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
+});
+
+test("H1: a null-conversation shell wake cannot overtake its active A2A owner turn", async () => {
+  fresh();
+  const owner = deferred();
+  const ownerStarted = deferred();
+  const calls = [];
+  let shell = null;
+  let wakeTurns = 0;
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+    if (!args.wakeFor) {
+      shell = launchShell({
+        from: "napoleon",
+        command: "echo immediate",
+        depth: 1,
+        origin: { channel: "a2a", conversation_id: null },
+      });
+      shell.child.emit("close", 0, null);
+      ownerStarted.resolve();
+      return owner.promise;
+    }
+    return { text: "caller acknowledged terminal result", thread: "charly~napoleon" };
+  };
+
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "own the task",
+    wake: true, depth: 1, messagePeerFn,
+  });
+  await ownerStarted.promise;
+  await until(() => readJob(shell.launched.job_id)?.status === "done", "fast shell to finish");
+
+  const wakePromise = wakeShellJob(readJob(shell.launched.job_id), {
+    projects: PROJECTS,
+    runChatTurnFn: async () => {
+      wakeTurns++;
+      return { conversation_id: null, text: "DONE: manager final result" };
+    },
+    messagePeerFn,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(wakeTurns, 0, "the shell cannot start a concurrent manager turn");
+  assert.equal(readJob(parent.job_id).status, "running");
+  assert.equal(parentWakeCalls(calls, parent.job_id).length, 0);
+
+  owner.resolve({ text: "Owner turn completed; process the shell result.", thread: "charly~napoleon" });
+  const wake = await wakePromise;
+  assert.equal(wake.woken, true);
+  assert.equal(wakeTurns, 1);
+  assert.equal(readJob(parent.job_id).status, "done");
+  assert.equal(readJob(parent.job_id).result, "DONE: manager final result");
+  assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
+});
+
+test("H2: an owner failure remains failed after its managed shell completes", async () => {
+  fresh();
+  const owner = deferred();
+  const ownerStarted = deferred();
+  const calls = [];
+  let shell = null;
+  let wakeTurns = 0;
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+    if (!args.wakeFor) {
+      shell = launchShell({
+        from: "napoleon",
+        origin: { channel: "a2a", conversation_id: null },
+      });
+      ownerStarted.resolve();
+      return owner.promise;
+    }
+    return { text: "caller received failure", thread: "charly~napoleon" };
+  };
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "fail after launch",
+    wake: true, messagePeerFn,
+  });
+  await ownerStarted.promise;
+  shell.child.emit("close", 0, null);
+  await until(() => readJob(shell.launched.job_id)?.status === "done", "shell to finish");
+  const wakePromise = wakeShellJob(readJob(shell.launched.job_id), {
+    projects: PROJECTS,
+    runChatTurnFn: async () => { wakeTurns++; return { text: "contradictory done" }; },
+    messagePeerFn,
+  });
+  owner.reject(new Error("manager exploded after launch"));
+  const wake = await wakePromise;
+
+  assert.equal(wakeTurns, 0, "a failed owner cannot be replaced by a success continuation");
+  assert.equal(wake.woken, false);
+  assert.match(wake.reason, /manager exploded after launch/);
+  assert.equal(readJob(parent.job_id).status, "failed");
+  assert.match(readJob(parent.job_id).result, /manager exploded after launch/);
+  assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
+});
+
+test("H3: settlement persistence failure never reruns a successful wake turn", async () => {
+  fresh();
+  let shell = null;
+  const calls = [];
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+    if (!args.wakeFor) shell = launchShell({ from: "napoleon" });
+    return { text: args.wakeFor ? "caller received failure" : "Waiting.", thread: "t" };
+  };
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "persist safely",
+    wake: true, messagePeerFn,
+  });
+  await until(() => shell, "managed shell to launch");
+  shell.child.emit("close", 0, null);
+  await until(() => readJob(shell.launched.job_id)?.status === "done", "shell to finish");
+  let wakeTurns = 0;
+  let settlements = 0;
+  const out = await wakeShellJob(readJob(shell.launched.job_id), {
+    projects: PROJECTS,
+    runChatTurnFn: async () => { wakeTurns++; return { text: "model completed once" }; },
+    settleManagedFn: async () => {
+      settlements++;
+      throw new Error("injected parent persistence failure");
+    },
+    retryDelayMs: 0,
+    messagePeerFn,
+  });
+
+  assert.equal(wakeTurns, 1);
+  assert.equal(settlements, 1);
+  assert.equal(out.woken, false);
+  assert.match(out.reason, /persistence failure/);
+  assert.equal(readJob(parent.job_id).status, "failed");
+  assert.match(readJob(parent.job_id).result, /persistence failure/);
+  assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
+});
+
+test("H4: shell wake restores managed A2A depth and rejects the next excessive handoff", async () => {
+  fresh();
+  let shell = null;
+  const messagePeerFn = async (args) => {
+    if (!args.wakeFor) {
+      shell = launchShell({ from: "napoleon", depth: MAX_BACKGROUND_DEPTH });
+      return { text: "Waiting.", thread: "t" };
+    }
+    return { text: "caller wake", thread: "t" };
+  };
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "at depth limit",
+    wake: true, depth: MAX_BACKGROUND_DEPTH, messagePeerFn,
+  });
+  await until(() => shell, "depth shell to launch");
+  assert.equal(readJob(shell.launched.job_id).depth, MAX_BACKGROUND_DEPTH);
+  shell.child.emit("close", 0, null);
+  await until(() => readJob(shell.launched.job_id)?.status === "done", "depth shell to finish");
+
+  let restoredDepth = null;
+  let rejection = null;
+  await wakeShellJob(readJob(shell.launched.job_id), {
+    projects: PROJECTS,
+    runChatTurnFn: async (args) => {
+      restoredDepth = args.channelMeta?.a2aDepth;
+      const handler = sendToAgent.makeHandler({
+        projects: PROJECTS,
+        channel: "a2a",
+        channelMeta: { ...args.channelMeta, agentSlug: "napoleon", to: "napoleon" },
+      });
+      rejection = await handler({ to: "claupernico", message: "one hop too far", background: true });
+      return { text: "DONE: depth checked" };
+    },
+    messagePeerFn,
+  });
+
+  assert.equal(restoredDepth, MAX_BACKGROUND_DEPTH);
+  assert.match(rejection.error, /depth limit/);
+  assert.equal(readJob(parent.job_id).status, "done");
+});
+
+test("H5: cancelling a managed parent prevents a live shell from resurrecting it", async () => {
+  fresh();
+  const calls = [];
+  let shell = null;
+  let wakeTurns = 0;
+  const owner = deferred();
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+    if (!args.wakeFor) {
+      shell = launchShell({ from: "napoleon", origin: { channel: "a2a", conversation_id: null } });
+      return owner.promise;
+    }
+    return { text: "caller saw cancellation", thread: "t" };
+  };
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "cancel parent",
+    wake: true, messagePeerFn,
+  });
+  await until(() => shell, "managed shell to launch");
+  await cancelJob(parent.job_id, { project: PROJECT, messagePeerFn });
+  assert.equal(readJob(parent.job_id).status, "cancelled");
+  assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
+
+  shell.child.emit("close", 0, null);
+  await until(() => readJob(shell.launched.job_id)?.status === "done", "live shell to finish");
+  const wake = await wakeShellJob(readJob(shell.launched.job_id), {
+    projects: PROJECTS,
+    runChatTurnFn: async () => { wakeTurns++; return { text: "must not run" }; },
+    messagePeerFn,
+  });
+  assert.equal(wake.woken, false);
+  assert.match(wake.reason, /parent already cancelled/);
+  assert.equal(wakeTurns, 0);
+  assert.equal(readJob(parent.job_id).status, "cancelled");
+  assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
+  owner.resolve({ text: "late owner result", thread: "t" });
+});
+
+test("H6: a deleted project records a recoverable parent failure without running wake", async () => {
+  fresh();
+  let shell = null;
+  let wakeTurns = 0;
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "project may disappear",
+    wake: true,
+    messagePeerFn: async () => {
+      shell = launchShell({ from: "napoleon" });
+      return { text: "Waiting.", thread: "t" };
+    },
+  });
+  await until(() => shell, "managed shell to launch");
+  await until(() => readJob(parent.job_id)?.managed_turn_active === false, "owner turn to end");
+  shell.child.emit("close", 0, null);
+  await until(() => readJob(shell.launched.job_id)?.status === "done", "shell to finish");
+  const out = await wakeShellJob(readJob(shell.launched.job_id), {
+    projects: { get: () => null },
+    runChatTurnFn: async () => { wakeTurns++; return { text: "must not run" }; },
+  });
+  assert.equal(out.woken, false);
+  assert.equal(out.reason, "project gone");
+  assert.equal(wakeTurns, 0);
+  assert.equal(readJob(parent.job_id).status, "failed");
+  assert.match(readJob(parent.job_id).result, /project .* is gone/);
+  assert.equal(wakeClaimed(parent.job_id), false, "upper wake remains visibly recoverable");
 });
