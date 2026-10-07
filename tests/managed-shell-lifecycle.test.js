@@ -20,7 +20,8 @@ const { runShellInBackground } = await import("#core/agent/shell/background.js")
 const {
   BACKGROUND_JOBS_DIR, closeJob, readJob, wakeClaimed,
 } = await import("#core/stores/background-jobs.js");
-const { wakeShellJob } = await import("#host/daemon/shell-job-wake.js");
+const { settleManagedDependency } = await import("#core/agent/managed-background.js");
+const { startShellJobWake, wakeShellJob } = await import("#host/daemon/shell-job-wake.js");
 
 const ROOT = makeTempProject({
   name: "acme-managed",
@@ -657,4 +658,130 @@ test("H6: a deleted project records a recoverable parent failure without running
   assert.equal(readJob(parent.job_id).status, "failed");
   assert.match(readJob(parent.job_id).result, /project .* is gone/);
   assert.equal(wakeClaimed(parent.job_id), false, "upper wake remains visibly recoverable");
+});
+
+test("N1: a dependency persistence failure releases ownership and does not rerun the wake turn", async () => {
+  fresh();
+  let firstShell = null;
+  let wakeTurns = 0;
+  let persistenceCalls = 0;
+  const messagePeerFn = async (args) => {
+    if (!args.wakeFor) firstShell = launchShell({ from: "napoleon" });
+    return { text: args.wakeFor ? "caller received failure" : "Waiting.", thread: "t" };
+  };
+  const firstParent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "persist first lifecycle",
+    wake: true, messagePeerFn,
+  });
+  await until(() => firstShell, "first managed shell to launch");
+  firstShell.child.emit("close", 0, null);
+  await until(() => readJob(firstShell.launched.job_id)?.status === "done", "first shell to finish");
+
+  const firstWake = await wakeShellJob(readJob(firstShell.launched.job_id), {
+    projects: PROJECTS,
+    runChatTurnFn: async () => {
+      wakeTurns++;
+      return { text: "model completed exactly once" };
+    },
+    settleManagedDependencyFn: (args) => {
+      persistenceCalls++;
+      if (persistenceCalls === 1) throw new Error("injected dependency write failure");
+      return settleManagedDependency(args);
+    },
+    messagePeerFn,
+  });
+
+  assert.equal(wakeTurns, 1);
+  assert.equal(persistenceCalls, 1);
+  assert.equal(firstWake.woken, false);
+  assert.match(firstWake.reason, /dependency write failure/);
+  assert.equal(readJob(firstParent.job_id).managed_turn_active, false);
+  assert.equal(readJob(firstParent.job_id).status, "failed");
+  assert.match(readJob(firstParent.job_id).result, /persistence failure/);
+
+  let secondShell = null;
+  const secondParent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "second lifecycle still advances",
+    wake: true,
+    messagePeerFn: async (args) => {
+      if (!args.wakeFor) secondShell = launchShell({ from: "napoleon" });
+      return { text: args.wakeFor ? "caller received second result" : "Waiting.", thread: "t2" };
+    },
+  });
+  await until(() => secondShell, "second managed shell to launch");
+  secondShell.child.emit("close", 0, null);
+  await until(() => readJob(secondShell.launched.job_id)?.status === "done", "second shell to finish");
+  const secondWake = await wakeShellJob(readJob(secondShell.launched.job_id), {
+    projects: PROJECTS,
+    runChatTurnFn: async () => ({ text: "DONE: second lifecycle" }),
+    messagePeerFn: async () => ({ text: "caller received second result", thread: "t2" }),
+  });
+  assert.equal(secondWake.woken, true);
+  assert.equal(readJob(secondParent.job_id).status, "done");
+});
+
+test("N2: an owner wait does not head-of-line block unrelated wakes for the same agent", async () => {
+  fresh();
+  const ownerA = deferred();
+  const ownerAStarted = deferred();
+  let shellA = null;
+  let shellC = null;
+  const wakeStarted = [];
+  const messagePeerFn = async (args) => {
+    if (args.from === "charly" && args.body === "lifecycle A") {
+      shellA = launchShell({ from: "napoleon", origin: { channel: "a2a", conversation_id: null } });
+      ownerAStarted.resolve();
+      return ownerA.promise;
+    }
+    if (args.from === "charly" && args.body === "lifecycle C") {
+      shellC = launchShell({ from: "napoleon", origin: { channel: "a2a", conversation_id: null } });
+      return { text: "C waiting.", thread: "c" };
+    }
+    return { text: "caller wake", thread: "t" };
+  };
+  const listener = startShellJobWake({
+    projects: PROJECTS,
+    messagePeerFn,
+    runChatTurnFn: async ({ promptMeta }) => {
+      wakeStarted.push(promptMeta.job.id);
+      return { text: `DONE: ${promptMeta.job.id}` };
+    },
+  });
+
+  try {
+    const parentA = sendInBackground({
+      project: PROJECT, from: "charly", to: "napoleon", body: "lifecycle A",
+      wake: true, messagePeerFn,
+    });
+    await ownerAStarted.promise;
+    shellA.child.emit("close", 0, null);
+    await until(() => readJob(shellA.launched.job_id)?.status === "done", "A shell to finish");
+
+    const independentB = launchShell({ from: "napoleon", command: "echo independent B" });
+    independentB.child.emit("close", 0, null);
+    await until(() => readJob(independentB.launched.job_id)?.status === "done", "B shell to finish");
+    await until(() => wakeStarted.includes(independentB.launched.job_id), "independent B wake to start");
+
+    const parentC = sendInBackground({
+      project: PROJECT, from: "charly", to: "napoleon", body: "lifecycle C",
+      wake: true, messagePeerFn,
+    });
+    await until(() => shellC, "C shell to launch");
+    shellC.child.emit("close", 0, null);
+    await until(() => readJob(shellC.launched.job_id)?.status === "done", "C shell to finish");
+    await until(() => wakeStarted.includes(shellC.launched.job_id), "lifecycle C wake to start");
+    await until(() => readJob(parentC.job_id)?.status === "done", "lifecycle C to close");
+
+    assert.equal(readJob(parentA.job_id).status, "running");
+    assert.equal(wakeStarted.includes(shellA.launched.job_id), false, "A remains correctly owned by its live turn");
+    assert.equal(wakeStarted.includes(independentB.launched.job_id), true);
+    assert.equal(wakeStarted.includes(shellC.launched.job_id), true);
+
+    ownerA.resolve({ text: "A owner finished.", thread: "a" });
+    await until(() => wakeStarted.includes(shellA.launched.job_id), "A wake after owner completion");
+    await until(() => readJob(parentA.job_id)?.status === "done", "lifecycle A to close");
+  } finally {
+    ownerA.resolve({ text: "A cleanup.", thread: "a" });
+    listener.stop();
+  }
 });
