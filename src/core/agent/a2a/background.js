@@ -34,8 +34,9 @@ import {
   JOB_KINDS, MAX_OPEN_A2A_JOBS_PER_AGENT, DEFAULT_A2A_JOB_TIMEOUT_S, TERMINAL_STATUSES,
 } from "#core/stores/background-jobs.js";
 import {
-  attachManagedDependency, hasManagedDependencies, managedParentJobId,
-  runInManagedBackground, settleManagedDependency,
+  attachManagedDependency, beginManagedContinuation, completeManagedTurn,
+  managedParentJobId, registerManagedTurn, runInManagedBackground,
+  settleManagedDependency,
 } from "#core/agent/managed-background.js";
 import { a2aThreadId } from "#core/stores/messages.js";
 import { emitBackgroundJobEvent } from "#core/events/bus.js";
@@ -132,7 +133,7 @@ export function wakeText(job) {
  *
  * @returns {Promise<{delivered: boolean, reason?: string}>}
  */
-export async function deliverWake(job, { project, config, projects, plugins, registries, messagePeerFn = messagePeer } = {}) {
+async function deliverWakeImpl(job, { project, config, projects, plugins, registries, messagePeerFn = messagePeer } = {}) {
   if (!job?.wake) return { delivered: false, reason: "job did not ask to be woken" };
   // A wake-up here is written AS THE PEER (`from: job.to`), so a job with no
   // peer cannot be delivered this way — a shell job's worker is a process, and
@@ -143,6 +144,39 @@ export async function deliverWake(job, { project, config, projects, plugins, reg
   if (jobKind(job) !== JOB_KINDS.A2A) return { delivered: false, reason: "not an a2a job" };
   if (!project) return { delivered: false, reason: "no project to file the wake-up in" };
   if (!claimWake(job.id)) return { delivered: false, reason: "already delivered" };
+
+  const finishParent = async ({ result = "", failure = null, completeTurn = false } = {}) => {
+    if (!job.parent_job_id) return null;
+    const released = settleManagedDependency({
+      parentJobId: job.parent_job_id,
+      childJobId: job.id,
+      failure,
+    });
+    const completed = completeTurn
+      ? completeManagedTurn({
+        parentJobId: job.parent_job_id,
+        status: failure ? "failed" : "done",
+        result: failure || result,
+      })
+      : { settled: null };
+    const settledParent = completed.settled || released.settled;
+    if (!settledParent) return null;
+    emitBackgroundJobEvent({ phase: "end", job: settledParent });
+    if (settledParent.wake) {
+      await deliverWake(settledParent, {
+        project, config, projects, plugins, registries, messagePeerFn,
+      });
+    }
+    return settledParent;
+  };
+
+  if (job.parent_job_id) {
+    const ownership = await beginManagedContinuation(job.parent_job_id);
+    if (!ownership.acquired) {
+      await finishParent();
+      return { delivered: false, reason: ownership.reason || "managed parent unavailable" };
+    }
+  }
 
   try {
     const result = await runInManagedBackground(
@@ -178,54 +212,22 @@ export async function deliverWake(job, { project, config, projects, plugins, reg
     // dependency set changed synchronously, so the outer job stays open. If it
     // did not, this wake completed the orchestration level and the outer job can
     // now settle and wake its own caller.
-    if (job.parent_job_id) {
-      const { settled: settledParent } = settleManagedDependency({
-        parentJobId: job.parent_job_id,
-        childJobId: job.id,
-        result: result?.text || "",
-      });
-
-      if (settledParent) {
-        emitBackgroundJobEvent({ phase: "end", job: settledParent });
-
-        if (settledParent.wake) {
-          await deliverWake(settledParent, {
-            project,
-            config,
-            projects,
-            plugins,
-            registries,
-            messagePeerFn,
-          });
-        }
-      }
-    }
+    await finishParent({ result: result?.text || "", completeTurn: true });
 
     return { delivered: true };
   } catch (e) {
-    if (job.parent_job_id) {
-      const { settled: failedParent } = settleManagedDependency({
-        parentJobId: job.parent_job_id,
-        childJobId: job.id,
-        failure: e?.message || String(e),
-      });
-      if (failedParent) {
-        emitBackgroundJobEvent({ phase: "end", job: failedParent });
-        if (failedParent.wake) {
-          await deliverWake(failedParent, {
-            project,
-            config,
-            projects,
-            plugins,
-            registries,
-            messagePeerFn,
-          });
-        }
-      }
-    }
+    await finishParent({ failure: e?.message || String(e), completeTurn: true });
     // The waiter did not wake. Say so where it can be seen rather than
     // swallowing it — the job record already holds the result, so nothing is
     // lost except the nudge, and the thread still carries the peer's answer.
+    return { delivered: false, reason: e?.message || String(e) };
+  }
+}
+
+export async function deliverWake(job, options = {}) {
+  try {
+    return await deliverWakeImpl(job, options);
+  } catch (e) {
     return { delivered: false, reason: e?.message || String(e) };
   }
 }
@@ -407,6 +409,7 @@ export function sendInBackground({
     depth,
     parent_job_id: managedParentId,
   });
+  registerManagedTurn(job.id);
 
   // Link the parent BEFORE starting the child. This ordering is deliberate:
   // a very fast child must never be able to finish before the parent knows that
@@ -442,40 +445,20 @@ export function sendInBackground({
     ))
     .then(
       (result) => {
-        const current = readJob(job.id);
-
-        if (!current || TERMINAL_STATUSES.includes(current.status)) {
-          return null;
-        }
-
-        // Returning from the manager's current turn is NOT completion when that
-        // turn handed ownership onward to a managed child.
-        if (hasManagedDependencies(current)) {
-          return null;
-        }
-
-        return closeJob(job.id, {
+        const { settled } = completeManagedTurn({
+          parentJobId: job.id,
           status: "done",
           result: result?.text || "",
         });
+        return settled;
       },
       (e) => {
-        const current = readJob(job.id);
-
-        if (!current || TERMINAL_STATUSES.includes(current.status)) {
-          return null;
-        }
-
-        // Same rule on the rejection path: once durable child work owns the
-        // orchestration, unwinding the spawning turn must not falsely close it.
-        if (hasManagedDependencies(current)) {
-          return null;
-        }
-
-        return closeJob(job.id, {
+        const { settled } = completeManagedTurn({
+          parentJobId: job.id,
           status: "failed",
           result: e?.message || String(e),
         });
+        return settled;
       },
     )
     .then(async (settled) => {

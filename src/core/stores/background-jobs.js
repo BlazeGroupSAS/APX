@@ -171,6 +171,8 @@ export function openJob({
         waiting_on_job_id: null,
         managed_dependency_ids: [],
         managed_dependency_failures: [],
+        managed_turn_active: true,
+        managed_turn_outcome: null,
       }
       : {}),
     status: "running",
@@ -233,7 +235,7 @@ export function closeJob(id, { status = "done", result = "", exit_code = undefin
  * Patch a RUNNING job's progress. For the live half of a shell job: its pid the
  * moment it is known, and the tail of its output as it comes.
  *
- * Refuses a terminal job, and takes a WHITELIST of fields, for the same reason
+ * Refuses a terminal job, and takes a WHITELIST of progress/lifecycle fields, for the same reason
  * `closeJob` keeps the first status it was given: a record that anything can
  * rewrite at any time is not a record. Progress is the only thing that changes
  * while a job runs — status, outcome and identity are settled elsewhere.
@@ -263,6 +265,18 @@ export function updateJob(id, patch = {}) {
         reason: String(entry?.reason || "").slice(0, 2000),
       })).filter((entry) => entry.job_id)
       : [];
+  }
+  if (patch.managed_turn_active !== undefined) {
+    next.managed_turn_active = !!patch.managed_turn_active;
+  }
+  if (patch.managed_turn_outcome !== undefined) {
+    const outcome = patch.managed_turn_outcome;
+    next.managed_turn_outcome = outcome && typeof outcome === "object"
+      ? {
+        status: TERMINAL_STATUSES.includes(outcome.status) ? outcome.status : "done",
+        result: String(outcome.result || "").slice(0, 8000),
+      }
+      : null;
   }
   writeJson(fileFor(id), next);
   return next;

@@ -1,12 +1,35 @@
 // Shared ownership for work launched during a managed background turn.
-// The async context identifies the owning A2A job; the job record is the
-// durable source of truth for every child that still keeps it open.
+// Durable job fields decide settlement; these in-process latches only prevent
+// a completed child from starting a second turn while its owner is still live.
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   closeJob, readJob, updateJob, TERMINAL_STATUSES,
 } from "#core/stores/background-jobs.js";
 
 const managedBackgroundContext = new AsyncLocalStorage();
+const activeTurns = new Map();
+
+function newLatch(jobId) {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  const latch = { promise, resolve };
+  activeTurns.set(String(jobId), latch);
+  return latch;
+}
+
+function releaseLatch(jobId) {
+  const key = String(jobId);
+  const latch = activeTurns.get(key);
+  if (!latch) return;
+  activeTurns.delete(key);
+  latch.resolve();
+}
+
+/** Register the already-open initial owner turn before detached work starts. */
+export function registerManagedTurn(jobId) {
+  if (!jobId) return null;
+  return activeTurns.get(String(jobId)) || newLatch(jobId);
+}
 
 /** Run a turn as part of one durable managed A2A job. */
 export function runInManagedBackground(parentJobId, fn) {
@@ -46,15 +69,94 @@ export function hasManagedDependencies(job) {
   return managedDependencyIds(job).length > 0;
 }
 
-/**
- * Release one child after its resumed turn ends. The parent settles only when
- * no dependency remains; a failed wake is retained and makes that settlement
- * failed instead of manufacturing DONE.
- */
+function settleIfReady(job) {
+  if (!job || TERMINAL_STATUSES.includes(job.status)) return null;
+  if (job.managed_turn_active || hasManagedDependencies(job)) return null;
+  const outcome = job.managed_turn_outcome;
+  if (!outcome) return null;
+  const failures = Array.isArray(job.managed_dependency_failures)
+    ? job.managed_dependency_failures
+    : [];
+  const ownerFailed = outcome.status !== "done";
+  const dependencyFailed = failures.length > 0;
+  const failureText = failures.map((entry) => `${entry.job_id}: ${entry.reason}`).join("; ");
+  return closeJob(job.id, {
+    status: ownerFailed || dependencyFailed ? "failed" : "done",
+    result: ownerFailed
+      ? outcome.result
+      : dependencyFailed
+        ? `Managed wake failed: ${failureText}`
+        : outcome.result,
+  });
+}
+
+/** Wait for the current owner without polling. */
+export async function waitForManagedTurn(parentJobId) {
+  if (!parentJobId) return { parent: null, orphaned: false };
+  let parent = readJob(parentJobId);
+  if (!parent || TERMINAL_STATUSES.includes(parent.status) || !parent.managed_turn_active) {
+    return { parent, orphaned: false };
+  }
+  const latch = activeTurns.get(String(parentJobId));
+  if (!latch) return { parent, orphaned: true };
+  await latch.promise;
+  parent = readJob(parentJobId);
+  return { parent, orphaned: !!parent?.managed_turn_active };
+}
+
+/** Acquire the next serialized continuation, unless the prior owner failed. */
+export async function beginManagedContinuation(parentJobId) {
+  if (!parentJobId) return { acquired: false, parent: null, reason: "no managed parent" };
+  const waited = await waitForManagedTurn(parentJobId);
+  let parent = waited.parent;
+  if (!parent || TERMINAL_STATUSES.includes(parent.status)) {
+    return { acquired: false, parent, reason: parent ? `parent already ${parent.status}` : "parent missing" };
+  }
+  if (waited.orphaned) {
+    const failed = completeManagedTurn({
+      parentJobId,
+      status: "failed",
+      result: "managed owner turn was lost before its dependency wake could resume",
+    });
+    return { acquired: false, parent: failed.parent, settled: failed.settled, reason: "managed owner turn lost" };
+  }
+  const outcome = parent.managed_turn_outcome;
+  if (outcome?.status && outcome.status !== "done") {
+    return { acquired: false, parent, reason: outcome.result || `owner ended ${outcome.status}` };
+  }
+  parent = updateJob(parent.id, {
+    managed_turn_active: true,
+    managed_turn_outcome: null,
+  });
+  registerManagedTurn(parentJobId);
+  return { acquired: true, parent };
+}
+
+/** Persist an owner result, release waiters, and settle only when children are gone. */
+export function completeManagedTurn({ parentJobId, status = "done", result = "" } = {}) {
+  if (!parentJobId) return { parent: null, settled: null };
+  const current = readJob(parentJobId);
+  if (!current || TERMINAL_STATUSES.includes(current.status)) {
+    releaseLatch(parentJobId);
+    return { parent: current, settled: null };
+  }
+  let parent;
+  try {
+    parent = updateJob(parentJobId, {
+      managed_turn_active: false,
+      managed_turn_outcome: { status, result },
+    });
+  } finally {
+    releaseLatch(parentJobId);
+  }
+  const settled = settleIfReady(parent);
+  return { parent: settled || parent, settled };
+}
+
+/** Release one child; an empty dependency set alone never closes its parent. */
 export function settleManagedDependency({
   parentJobId,
   childJobId,
-  result = "",
   failure = null,
 } = {}) {
   if (!parentJobId || !childJobId) return { parent: null, settled: null };
@@ -77,15 +179,6 @@ export function settleManagedDependency({
     managed_dependency_failures: failures,
     waiting_on_job_id: remaining.at(-1) || null,
   });
-  if (!updated || remaining.length > 0) return { parent: updated, settled: null };
-
-  const failed = failures.length > 0;
-  const failureText = failures
-    .map((entry) => `${entry.job_id}: ${entry.reason}`)
-    .join("; ");
-  const settled = closeJob(parent.id, {
-    status: failed ? "failed" : "done",
-    result: failed ? `Managed wake failed: ${failureText}` : result,
-  });
-  return { parent: settled, settled };
+  const settled = settleIfReady(updated);
+  return { parent: settled || updated, settled };
 }

@@ -29,7 +29,8 @@ import { claimWake, jobKind, JOB_KINDS } from "#core/stores/background-jobs.js";
 import { shellWakeText } from "#core/agent/shell/background.js";
 import { deliverWake } from "#core/agent/a2a/background.js";
 import {
-  runInManagedBackground, settleManagedDependency,
+  beginManagedContinuation, completeManagedTurn, runInManagedBackground,
+  settleManagedDependency,
 } from "#core/agent/managed-background.js";
 import { readAgents } from "#core/apc/parser.js";
 import { resolveAgentModel } from "#core/agent/agent-model.js";
@@ -83,6 +84,7 @@ async function waitForQuietChat(projectId, conversationId, log) {
 async function settleManagedShellDependency(job, {
   result = "",
   failure = null,
+  completeTurn = false,
   project = null,
   config,
   projects,
@@ -92,12 +94,19 @@ async function settleManagedShellDependency(job, {
   log,
 } = {}) {
   if (!job?.parent_job_id) return null;
-  const { settled } = settleManagedDependency({
+  const released = settleManagedDependency({
     parentJobId: job.parent_job_id,
     childJobId: job.id,
-    result,
     failure,
   });
+  const completed = completeTurn
+    ? completeManagedTurn({
+      parentJobId: job.parent_job_id,
+      status: failure ? "failed" : "done",
+      result: failure || result,
+    })
+    : { settled: null };
+  const settled = completed.settled || released.settled;
   if (!settled) return null;
 
   emitBackgroundJobEvent({ phase: "end", job: settled });
@@ -121,12 +130,13 @@ async function settleManagedShellDependency(job, {
  * Wake the agent that left this job running. Never throws — it is called from an
  * event listener, and an unhandled rejection here would take the daemon with it.
  */
-export async function wakeShellJob(job, {
+async function wakeShellJobImpl(job, {
   projects, config, plugins, registries, log, messagePeerFn,
   // Injected the way `replyAsAgent` takes `runAgentTurnFn`: this function's job
   // is deciding WHO is woken, WHERE, and exactly once — all three worth
   // asserting without standing up an engine to answer the wake-up.
   runChatTurnFn = runChatTurn,
+  settleManagedFn = settleManagedShellDependency,
   // How long to wait before the second attempt. Injectable for the same reason
   // runChatTurnFn is: the retry is behaviour worth asserting, and a test that
   // asserts it should not pay two real seconds for the privilege — nor await an
@@ -173,6 +183,32 @@ export async function wakeShellJob(job, {
   // spent the tokens and done the work twice.
   if (!claimWake(job.id)) return { woken: false, reason: "already delivered" };
 
+  if (job.parent_job_id) {
+    let ownership;
+    try {
+      ownership = await beginManagedContinuation(job.parent_job_id);
+      if (!ownership.acquired) {
+        await settleManagedFn(job, {
+          project, config, projects, plugins, registries, messagePeerFn, log,
+        });
+        return { woken: false, reason: ownership.reason || "managed parent unavailable" };
+      }
+    } catch (e) {
+      const reason = `managed ownership failed: ${e?.message || e}`;
+      log?.(`shell-job-wake: ${reason}`);
+      try {
+        await settleManagedShellDependency(job, {
+          failure: reason,
+          completeTurn: true,
+          project, config, projects, plugins, registries, messagePeerFn, log,
+        });
+      } catch (persistError) {
+        log?.(`shell-job-wake: could not persist ownership failure for ${job.id} — ${persistError?.message || persistError}`);
+      }
+      return { woken: false, reason };
+    }
+  }
+
   // TWO ATTEMPTS, because the claim is already spent. Nothing re-delivers a
   // wake-up: the reconciler only sweeps jobs that are still open, so a turn that
   // throws is the end of it — which is exactly what happened on 2026-09-14, when
@@ -183,74 +219,83 @@ export async function wakeShellJob(job, {
   // conversation, so the next turn anybody starts in that chat reads it as
   // history. The agent loses the chance to act on its own, not the information.
   let lastError = null;
+  let out = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
-  try {
-    const out = await runInManagedBackground(job.parent_job_id || null, () => runChatTurnFn({
-      p: project,
-      agent,
-      modelId,
-      conversationId: job.origin?.conversation_id || null,
-      channel: job.origin?.channel || CHANNELS.API,
-      prompt: shellWakeText(job),
-      // Nobody typed this. Recorded on the turn so the thread's own history says
-      // where it came from, rather than reading as the owner having pasted an
-      // exit code into their chat at four in the morning.
-      //
-      // The outcome rides as FIELDS, not only inside the prose: the panel draws
-      // a line from them, and parsing "it exited 127" back out of a paragraph
-      // written for a model is the kind of thing that works until the paragraph
-      // is reworded.
-      promptMeta: {
-        automation: "background_job",
-        job: {
-          id: job.id,
-          status: job.status,
-          exit_code: job.exit_code ?? null,
-          command: String(job.command || "").slice(0, 300),
+    try {
+      out = await runInManagedBackground(job.parent_job_id || null, () => runChatTurnFn({
+        p: project,
+        agent,
+        modelId,
+        conversationId: job.origin?.conversation_id || null,
+        channel: job.origin?.channel || CHANNELS.API,
+        channelMeta: { a2aDepth: Number(job.depth) || 0 },
+        prompt: shellWakeText(job),
+        // Nobody typed this. Recorded on the turn so the thread's own history says
+        // where it came from, rather than reading as the owner having pasted an
+        // exit code into their chat at four in the morning.
+        promptMeta: {
+          automation: "background_job",
+          job: {
+            id: job.id,
+            status: job.status,
+            exit_code: job.exit_code ?? null,
+            command: String(job.command || "").slice(0, 300),
+          },
         },
-      },
-      config: project.config || config,
-      projects,
-      plugins,
-      registries,
-    }));
-    await settleManagedShellDependency(job, {
-      result: out?.text || "",
-      project,
-      config,
-      projects,
-      plugins,
-      registries,
-      messagePeerFn,
-      log,
-    });
-    log?.(`shell-job-wake: woke ${job.from} for ${job.id} in ${out.conversation_id}`);
-    return { woken: true, conversation_id: out.conversation_id };
-  } catch (e) {
-    lastError = e;
-    if (attempt === 1) {
-      log?.(`shell-job-wake: wake for ${job.id} failed (${e?.message || e}) — retrying once`);
-      if (retryDelayMs > 0) await sleep(retryDelayMs);
-      continue;
+        config: project.config || config,
+        projects,
+        plugins,
+        registries,
+      }));
+      lastError = null;
+      break;
+    } catch (e) {
+      lastError = e;
+      if (attempt === 1) {
+        log?.(`shell-job-wake: wake for ${job.id} failed (${e?.message || e}) — retrying once`);
+        if (retryDelayMs > 0) await sleep(retryDelayMs);
+        continue;
+      }
+      log?.(`shell-job-wake: wake for ${job.id} failed — ${e?.message || e}`);
     }
-    // The record still holds the outcome and the panel still shows it ended, so
-    // what is lost is the nudge, not the result. Said out loud rather than
-    // swallowed — an agent that was promised a wake-up and did not get one is
-    // the failure this whole feature exists to remove.
-    log?.(`shell-job-wake: wake for ${job.id} failed — ${e?.message || e}`);
   }
+
+  const wakeFailure = lastError ? (lastError?.message || String(lastError)) : null;
+  try {
+    await settleManagedFn(job, {
+      result: out?.text || "",
+      failure: wakeFailure,
+      completeTurn: !!job.parent_job_id,
+      project, config, projects, plugins, registries, messagePeerFn, log,
+    });
+  } catch (e) {
+    const reason = `managed lifecycle persistence failure: ${e?.message || e}`;
+    log?.(`shell-job-wake: ${reason}`);
+    try {
+      await settleManagedShellDependency(job, {
+        failure: reason,
+        completeTurn: !!job.parent_job_id,
+        project, config, projects, plugins, registries, messagePeerFn, log,
+      });
+    } catch (fallbackError) {
+      log?.(`shell-job-wake: fallback persistence failed for ${job.id} — ${fallbackError?.message || fallbackError}`);
+    }
+    return { woken: false, reason };
   }
-  await settleManagedShellDependency(job, {
-    failure: lastError?.message || String(lastError),
-    project,
-    config,
-    projects,
-    plugins,
-    registries,
-    messagePeerFn,
-    log,
-  });
-  return { woken: false, reason: lastError?.message || String(lastError) };
+
+  if (wakeFailure) return { woken: false, reason: wakeFailure };
+  log?.(`shell-job-wake: woke ${job.from} for ${job.id} in ${out?.conversation_id}`);
+  return { woken: true, conversation_id: out?.conversation_id };
+}
+
+export async function wakeShellJob(job, options = {}) {
+  try {
+    return await wakeShellJobImpl(job, options);
+  } catch (e) {
+    const reason = e?.message || String(e);
+    options.log?.(`shell-job-wake: unhandled wake failure for ${job?.id || "unknown"} — ${reason}`);
+    return { woken: false, reason };
+  }
 }
 
 /**

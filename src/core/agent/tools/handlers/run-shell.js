@@ -232,6 +232,7 @@ export default {
         cwd: workingDir,
         timeout_s: timeout_s ?? DEFAULT_JOB_TIMEOUT_S,
         wake: wakeable && wake_me !== false,
+        depth: Number(channelMeta?.a2aDepth) || 0,
         origin: {
           channel: channel || null,
           // Absent on a routine or a Telegram turn; the wake-up opens a fresh

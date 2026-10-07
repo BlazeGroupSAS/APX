@@ -173,6 +173,7 @@ export function runShellInBackground({
   cwd,
   timeout_s = DEFAULT_JOB_TIMEOUT_S,
   wake = true,
+  depth = 0,
   origin = null,
   spawnFn = spawn,
   shellCommandFn = shellCommand,
@@ -204,6 +205,7 @@ export function runShellInBackground({
     cwd: cwd || null,
     wake: !!wake,
     timeout_s: ttl,
+    depth,
     origin,
     parent_job_id: managedParentId,
   });
