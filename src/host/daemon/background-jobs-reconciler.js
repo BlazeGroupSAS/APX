@@ -22,6 +22,9 @@
 import {
   listJobs, closeJob, ownerAlive, jobExpired, pruneJobs, jobKind, JOB_KINDS,
 } from "#core/stores/background-jobs.js";
+import {
+  completeManagedTurn, hasManagedOwner, managedDependencyIds, reconcileManagedDependencies,
+} from "#core/agent/managed-background.js";
 import { deliverWake } from "#core/agent/a2a/background.js";
 import { emitBackgroundJobEvent } from "#core/events/bus.js";
 
@@ -46,33 +49,63 @@ export async function reconcileBackgroundJobs({
 
   for (const job of open) {
     try {
-      const alive = ownerAlive(job);
-      const expired = jobExpired(job);
-      // A live owner inside its budget is simply working. Leave it alone — this
-      // sweep must never harvest a job that is still running.
-      if (alive && !expired) continue;
+      let settled = null;
+      // A managed parent can be parked on bookkeeping a failed write left
+      // behind: an "active" owner turn this process no longer holds, or a
+      // dependency on a child whose wake already ran. Settle those here — the
+      // only alternative is parking until the deadline over nothing.
+      if (jobKind(job) === JOB_KINDS.A2A) {
+        // Every a2a record is born `managed_turn_active`; dependencies are what
+        // only a real managed turn can attach. Requiring one keeps a freshly
+        // opened job — its owner latch is still being registered — out of this
+        // branch, where "no owner" would otherwise misread as "owner lost".
+        const orphanedOwner = job.managed_turn_active
+          && job.daemon_pid === process.pid
+          && !hasManagedOwner(job.id)
+          && managedDependencyIds(job).length > 0;
+        if (orphanedOwner) {
+          settled = completeManagedTurn({
+            parentJobId: job.id,
+            status: "failed",
+            result: "managed owner turn ended but its outcome could not be persisted",
+          }).settled;
+        }
+        if (!settled) settled = reconcileManagedDependencies(job.id).settled;
+        if (settled) {
+          closed++;
+          emitBackgroundJobEvent({ phase: "end", job: settled });
+          log?.(`background-jobs: settled managed parent ${job.id} — released what a failed write left behind`);
+        }
+      }
+      if (!settled) {
+        const alive = ownerAlive(job);
+        const expired = jobExpired(job);
+        // A live owner inside its budget is simply working. Leave it alone — this
+        // sweep must never harvest a job that is still running.
+        if (alive && !expired) continue;
 
-      // A recycled pid can make a dead owner look alive; the deadline is what
-      // catches that, which is why an expired job is closed regardless of what
-      // `ownerAlive` claims.
-      const status = alive ? "timed_out" : "lost";
-      const reason = alive
-        ? `ran past its ${job.timeout_s}s budget`
-        : "the daemon holding it exited before it finished";
+        // A recycled pid can make a dead owner look alive; the deadline is what
+        // catches that, which is why an expired job is closed regardless of what
+        // `ownerAlive` claims.
+        const status = alive ? "timed_out" : "lost";
+        const reason = alive
+          ? `ran past its ${job.timeout_s}s budget`
+          : "the daemon holding it exited before it finished";
 
-      const settled = closeJob(job.id, { status, result: reason });
-      if (!settled) continue;
-      closed++;
-      // The same frame the live path sends when a job settles. A job harvested
-      // here ended just as really as one that answered, and a panel still
-      // showing it as running is the stale spinner this feature exists to kill.
-      emitBackgroundJobEvent({ phase: "end", job: settled });
-      // Named by what it WAS: a peer for an a2a job, the command for a shell one
-      // (whose `to` is null — there is nobody on the other end of a process).
-      const what = jobKind(job) === JOB_KINDS.SHELL
-        ? `${job.from} ran ${String(job.command || "").slice(0, 80)}`
-        : `${job.from} → ${job.to}`;
-      log?.(`background-jobs: closed ${job.id} (${what}) as ${status} — ${reason}`);
+        settled = closeJob(job.id, { status, result: reason });
+        if (!settled) continue;
+        closed++;
+        // The same frame the live path sends when a job settles. A job harvested
+        // here ended just as really as one that answered, and a panel still
+        // showing it as running is the stale spinner this feature exists to kill.
+        emitBackgroundJobEvent({ phase: "end", job: settled });
+        // Named by what it WAS: a peer for an a2a job, the command for a shell one
+        // (whose `to` is null — there is nobody on the other end of a process).
+        const what = jobKind(job) === JOB_KINDS.SHELL
+          ? `${job.from} ran ${String(job.command || "").slice(0, 80)}`
+          : `${job.from} → ${job.to}`;
+        log?.(`background-jobs: closed ${job.id} (${what}) as ${status} — ${reason}`);
+      }
 
       // A shell job's wake-up is not this function's to deliver: the `end` frame
       // above is what shell-job-wake.js listens for, and it takes the agent back

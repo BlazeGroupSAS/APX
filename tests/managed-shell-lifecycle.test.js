@@ -13,15 +13,16 @@ const { test } = await import("node:test");
 const { default: assert } = await import("node:assert/strict");
 const { makeTempProject } = await import("./_helpers.js");
 const {
-  cancelJob, MAX_BACKGROUND_DEPTH, sendInBackground,
+  cancelJob, deliverWake, MAX_BACKGROUND_DEPTH, sendInBackground,
 } = await import("#core/agent/a2a/background.js");
 const sendToAgent = (await import("#core/agent/tools/handlers/send-to-agent.js")).default;
 const { runShellInBackground } = await import("#core/agent/shell/background.js");
 const {
-  BACKGROUND_JOBS_DIR, closeJob, readJob, wakeClaimed,
+  BACKGROUND_JOBS_DIR, closeJob, readJob, wakeClaimed, TERMINAL_STATUSES,
 } = await import("#core/stores/background-jobs.js");
 const { settleManagedDependency } = await import("#core/agent/managed-background.js");
 const { startShellJobWake, wakeShellJob } = await import("#host/daemon/shell-job-wake.js");
+const { reconcileBackgroundJobs } = await import("#host/daemon/background-jobs-reconciler.js");
 
 const ROOT = makeTempProject({
   name: "acme-managed",
@@ -784,4 +785,220 @@ test("N2: an owner wait does not head-of-line block unrelated wakes for the same
     ownerA.resolve({ text: "A cleanup.", thread: "a" });
     listener.stop();
   }
+});
+
+test("N3: a failed parent write frees the latch and the next managed continuation advances", async () => {
+  fresh();
+  const calls = [];
+  const firstAnswer = deferred();
+  const secondAnswer = deferred();
+  let firstChildId = null;
+  let secondChildId = null;
+  // Failing REAL writes: the patch intercepts writeJson's underlying fs call
+  // for the parent record only, while a flag keeps the window open.
+  let failParentWrites = false;
+  const realWrite = fs.writeFileSync;
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+    if (args.from === "charly" && args.to === "napoleon" && !args.wakeFor) {
+      firstChildId = sendInBackground({
+        project: PROJECT, from: "napoleon", to: "devincci", body: "first child",
+        wake: true, depth: 1, messagePeerFn,
+      }).job_id;
+      secondChildId = sendInBackground({
+        project: PROJECT, from: "napoleon", to: "devincci", body: "second child",
+        wake: true, depth: 1, messagePeerFn,
+      }).job_id;
+      return { text: "Two children delegated.", thread: "charly~napoleon" };
+    }
+    if (args.from === "napoleon" && args.to === "devincci" && !args.wakeFor) {
+      return args.body === "first child" ? firstAnswer.promise : secondAnswer.promise;
+    }
+    if (args.wakeFor === firstChildId) {
+      // The wake turn ran. From here on the parent's writes are broken.
+      failParentWrites = true;
+      return { text: "wake turn ran once", thread: "devincci~napoleon" };
+    }
+    return { text: "ack", thread: "t" };
+  };
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "run both children",
+    wake: true, messagePeerFn,
+  });
+  await until(() => firstChildId && secondChildId, "both managed children to open");
+  const parentFile = `${parent.job_id}.json`;
+  fs.writeFileSync = function (file, data, options) {
+    if (failParentWrites && String(file).includes(parentFile)) {
+      throw new Error("injected parent persistence failure");
+    }
+    return realWrite.call(this, file, data, options);
+  };
+
+  try {
+    // The child's job record is closed directly so this test drives the wake:
+    // its detached .then chain stays parked on firstAnswer and cannot race
+    // the delivery under test.
+    const firstDone = closeJob(firstChildId, { status: "done", result: "first child done" });
+    const firstDelivery = await deliverWake(firstDone, { project: PROJECT, messagePeerFn });
+    assert.equal(firstDelivery.delivered, false);
+    assert.match(firstDelivery.reason, /persistence failure/);
+  } finally {
+    failParentWrites = false;
+    fs.writeFileSync = realWrite;
+  }
+
+  assert.equal(
+    calls.filter((c) => c.wakeFor === firstChildId).length, 1,
+    "the failed wake ran its turn exactly once — never re-run",
+  );
+  const stranded = readJob(parent.job_id);
+  assert.equal(stranded.status, "running");
+  assert.equal(stranded.managed_turn_active, true, "the outcome write never landed");
+  assert.deepEqual(stranded.managed_dependency_ids.sort(), [firstChildId, secondChildId].sort());
+
+  // Persistence restored. The NEXT continuation of this same lifecycle must
+  // advance: before the fix it parked forever on the latch the failed write
+  // left held. The orphaned-owner state resolves to an honest failure and the
+  // stale dependency rows are pruned on the way to a terminal record.
+  const secondDone = closeJob(secondChildId, { status: "done", result: "second child done" });
+  const secondDelivery = await deliverWake(secondDone, { project: PROJECT, messagePeerFn });
+  assert.equal(secondDelivery.delivered, false);
+  assert.match(secondDelivery.reason, /owner turn lost/);
+
+  const settled = readJob(parent.job_id);
+  assert.equal(settled.status, "failed", "the lifecycle reached a coherent terminal state");
+  assert.deepEqual(settled.managed_dependency_ids, [], "no orphaned dependency remains");
+  assert.equal(
+    calls.filter((c) => c.wakeFor === secondChildId).length, 0,
+    "a refused continuation does not run the model again",
+  );
+  assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
+
+  // Drain the detached chains so nothing dangles past this test.
+  firstAnswer.resolve({ text: "late", thread: "t" });
+  secondAnswer.resolve({ text: "late", thread: "t" });
+});
+
+test("N4: a failed dependency release is healed by reconciliation, not by the deadline", async () => {
+  fresh();
+  const calls = [];
+  let shell = null;
+  let wakeTurns = 0;
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+    if (!args.wakeFor) shell = launchShell({ from: "napoleon" });
+    return { text: "Waiting.", thread: "t" };
+  };
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "manage a command",
+    wake: true, messagePeerFn,
+  });
+  await until(() => shell, "managed shell to launch");
+  await until(() => readJob(parent.job_id)?.managed_turn_active === false, "owner turn to end");
+  shell.child.emit("close", 0, null);
+  await until(() => readJob(shell.launched.job_id)?.status === "done", "shell to finish");
+
+  // Only the write that removes the finished child from the parent's
+  // dependency list fails — the turn outcome itself must persist first.
+  const childId = shell.launched.job_id;
+  const parentFile = `${parent.job_id}.json`;
+  const realWrite = fs.writeFileSync;
+  fs.writeFileSync = function (file, data, options) {
+    if (String(file).includes(parentFile)) {
+      let parsed = null;
+      try { parsed = JSON.parse(String(data)); } catch { /* not the job record */ }
+      if (
+        Array.isArray(parsed?.managed_dependency_ids)
+        && !parsed.managed_dependency_ids.map(String).includes(childId)
+      ) {
+        throw new Error("injected dependency release failure");
+      }
+    }
+    return realWrite.call(this, file, data, options);
+  };
+
+  let out;
+  try {
+    out = await wakeShellJob(readJob(childId), {
+      projects: PROJECTS,
+      runChatTurnFn: async () => { wakeTurns++; return { text: "wake turn ran once" }; },
+      retryDelayMs: 0,
+      messagePeerFn,
+    });
+  } finally {
+    fs.writeFileSync = realWrite;
+  }
+
+  assert.equal(wakeTurns, 1);
+  assert.equal(out.woken, false);
+  assert.match(out.reason, /persistence failure/);
+  const parked = readJob(parent.job_id);
+  assert.equal(parked.status, "running", "the failed release leaves the parent open");
+  assert.equal(parked.managed_turn_active, false, "the turn outcome persisted");
+  assert.deepEqual(parked.managed_dependency_ids, [childId], "the finished child is still listed — for now");
+
+  // Persistence restored: the next reconcile pass must settle the lifecycle —
+  // twelve hours at the deadline is the failure this fix exists to remove.
+  await reconcileBackgroundJobs({
+    projects: PROJECTS, config: {}, log: () => {},
+    deliverWakeFn: async () => ({ delivered: true }),
+  });
+  const after = readJob(parent.job_id);
+  assert.deepEqual(after.managed_dependency_ids, [], "no orphaned dependency remains");
+  assert.equal(after.status, "failed");
+  assert.match(after.result, /persistence failure|dependency/i);
+});
+
+test("N5: the reconciler closes a managed owner whose outcome write never landed", async () => {
+  fresh();
+  let shell = null;
+  let wakeTurns = 0;
+  let failParentWrites = false;
+  const realWrite = fs.writeFileSync;
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "manage a command",
+    wake: true,
+    messagePeerFn: async () => {
+      shell = launchShell({ from: "napoleon" });
+      return { text: "Waiting.", thread: "t" };
+    },
+  });
+  await until(() => shell, "managed shell to launch");
+  shell.child.emit("close", 0, null);
+  await until(() => readJob(shell.launched.job_id)?.status === "done", "shell to finish");
+  const parentFile = `${parent.job_id}.json`;
+  fs.writeFileSync = function (file, data, options) {
+    if (failParentWrites && String(file).includes(parentFile)) {
+      throw new Error("injected parent write failure");
+    }
+    return realWrite.call(this, file, data, options);
+  };
+
+  let out;
+  try {
+    out = await wakeShellJob(readJob(shell.launched.job_id), {
+      projects: PROJECTS,
+      runChatTurnFn: async () => { wakeTurns++; failParentWrites = true; return { text: "wake turn ran once" }; },
+      retryDelayMs: 0,
+      messagePeerFn: async () => ({ text: "ack", thread: "t" }),
+    });
+  } finally {
+    failParentWrites = false;
+    fs.writeFileSync = realWrite;
+  }
+
+  assert.equal(wakeTurns, 1);
+  assert.equal(out.woken, false);
+  const parked = readJob(parent.job_id);
+  assert.equal(parked.status, "running");
+  assert.equal(parked.managed_turn_active, true, "the durable record still claims a live owner");
+
+  await reconcileBackgroundJobs({
+    projects: PROJECTS, config: {}, log: () => {},
+    deliverWakeFn: async () => ({ delivered: true }),
+  });
+  const after = readJob(parent.job_id);
+  assert.equal(after.status, "failed", "an owner nobody holds is closed, not waited on");
+  assert.deepEqual(after.managed_dependency_ids, []);
+  assert.equal(TERMINAL_STATUSES.includes(after.status), true);
 });

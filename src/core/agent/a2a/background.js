@@ -34,8 +34,9 @@ import {
   JOB_KINDS, MAX_OPEN_A2A_JOBS_PER_AGENT, DEFAULT_A2A_JOB_TIMEOUT_S, TERMINAL_STATUSES,
 } from "#core/stores/background-jobs.js";
 import {
-  attachManagedDependency, beginManagedContinuation, completeManagedTurn,
-  managedParentJobId, registerManagedTurn, runInManagedBackground,
+  attachManagedDependency, beginManagedContinuation, clearPendingManagedWake,
+  completeManagedTurn, managedParentJobId, markPendingManagedWake,
+  registerManagedTurn, releaseManagedTurnOwnership, runInManagedBackground,
   settleManagedDependency,
 } from "#core/agent/managed-background.js";
 import { a2aThreadId } from "#core/stores/messages.js";
@@ -144,83 +145,124 @@ async function deliverWakeImpl(job, { project, config, projects, plugins, regist
   if (jobKind(job) !== JOB_KINDS.A2A) return { delivered: false, reason: "not an a2a job" };
   if (!project) return { delivered: false, reason: "no project to file the wake-up in" };
   if (!claimWake(job.id)) return { delivered: false, reason: "already delivered" };
-
-  const finishParent = async ({ result = "", failure = null, completeTurn = false } = {}) => {
-    if (!job.parent_job_id) return null;
-    const released = settleManagedDependency({
-      parentJobId: job.parent_job_id,
-      childJobId: job.id,
-      failure,
-    });
-    const completed = completeTurn
-      ? completeManagedTurn({
-        parentJobId: job.parent_job_id,
-        status: failure ? "failed" : "done",
-        result: failure || result,
-      })
-      : { settled: null };
-    const settledParent = completed.settled || released.settled;
-    if (!settledParent) return null;
-    emitBackgroundJobEvent({ phase: "end", job: settledParent });
-    if (settledParent.wake) {
-      await deliverWake(settledParent, {
-        project, config, projects, plugins, registries, messagePeerFn,
-      });
-    }
-    return settledParent;
-  };
-
-  if (job.parent_job_id) {
-    const ownership = await beginManagedContinuation(job.parent_job_id);
-    if (!ownership.acquired) {
-      await finishParent();
-      return { delivered: false, reason: ownership.reason || "managed parent unavailable" };
-    }
-  }
+  // While this wake is delivering, its dependency on the parent is live
+  // bookkeeping — a settle elsewhere must not read it as a failed-release
+  // orphan. Cleared on every exit below.
+  markPendingManagedWake(job.id);
 
   try {
-    const result = await runInManagedBackground(
-      job.parent_job_id || null,
-      () => messagePeerFn({
-      project,
-      // Reversed on purpose: the one who WORKED is now the one writing, so the
-      // wake-up lands in the same thread as the request and reads as its reply.
-      from: job.to,
-      to: job.from,
-      body: wakeText(job),
-      mode: "chat",
-      config,
-      projects,
-      plugins,
-      registries,
-      // A wake returns to the parent level of the active delegation chain.
-      // The completed child no longer contributes to nesting. Otherwise every
-      // request/wake cycle would grow depth forever after work had completed.
-      depth: Math.max(0, (Number(job.depth) || 0) - 1),
-      // The woken turn's output is the waiter's own note, NOT a reply to the
-      // peer. Filed as a reply it landed in the peer's inbox as "Recibido…",
-      // the peer answered "Confirmado…", and one status report became a
-      // four-message ping-pong of full tool loops (2026-09-23: ~230 a2a
-      // messages in 50 minutes, most of them acknowledgements).
-      wakeFor: job.id,
-    }),
-    );
+    const finishParent = async ({ result = "", failure = null, completeTurn = false } = {}) => {
+      if (!job.parent_job_id) return null;
+      let completed = { settled: null };
+      let released = { settled: null };
+      try {
+        // Persist the turn outcome first, the same order the shell wake uses:
+        // if releasing the dependency then fails, the durable parent is
+        // non-active and cannot strand an in-memory waiter on the latch.
+        completed = completeTurn
+          ? completeManagedTurn({
+            parentJobId: job.parent_job_id,
+            status: failure ? "failed" : "done",
+            result: failure || result,
+          })
+          : completed;
+        released = settleManagedDependency({
+          parentJobId: job.parent_job_id,
+          childJobId: job.id,
+          failure,
+        });
+      } finally {
+        // A write failure must not park the next continuation on a latch
+        // nobody will ever release.
+        if (completeTurn) releaseManagedTurnOwnership(job.parent_job_id);
+      }
+      const settledParent = released.settled || completed.settled;
+      if (!settledParent) return null;
+      emitBackgroundJobEvent({ phase: "end", job: settledParent });
+      if (settledParent.wake) {
+        await deliverWake(settledParent, {
+          project, config, projects, plugins, registries, messagePeerFn,
+        });
+      }
+      return settledParent;
+    };
 
-    // A child wake resumes the manager that owns the OUTER background job.
-    //
-    // If that resumed manager delegated more managed work, its durable
-    // dependency set changed synchronously, so the outer job stays open. If it
-    // did not, this wake completed the orchestration level and the outer job can
-    // now settle and wake its own caller.
-    await finishParent({ result: result?.text || "", completeTurn: true });
+    if (job.parent_job_id) {
+      let ownership;
+      try {
+        ownership = await beginManagedContinuation(job.parent_job_id);
+      } catch (e) {
+        const reason = `managed ownership failed: ${e?.message || e}`;
+        try {
+          await finishParent({ failure: reason, completeTurn: true });
+        } catch { /* the durable record keeps whatever write landed */ }
+        return { delivered: false, reason };
+      }
+      if (!ownership.acquired) {
+        await finishParent();
+        return { delivered: false, reason: ownership.reason || "managed parent unavailable" };
+      }
+    }
 
-    return { delivered: true };
-  } catch (e) {
-    await finishParent({ failure: e?.message || String(e), completeTurn: true });
-    // The waiter did not wake. Say so where it can be seen rather than
-    // swallowing it — the job record already holds the result, so nothing is
-    // lost except the nudge, and the thread still carries the peer's answer.
-    return { delivered: false, reason: e?.message || String(e) };
+    try {
+      const result = await runInManagedBackground(
+        job.parent_job_id || null,
+        () => messagePeerFn({
+          project,
+          // Reversed on purpose: the one who WORKED is now the one writing, so the
+          // wake-up lands in the same thread as the request and reads as its reply.
+          from: job.to,
+          to: job.from,
+          body: wakeText(job),
+          mode: "chat",
+          config,
+          projects,
+          plugins,
+          registries,
+          // A wake returns to the parent level of the active delegation chain.
+          // The completed child no longer contributes to nesting. Otherwise every
+          // request/wake cycle would grow depth forever after work had completed.
+          depth: Math.max(0, (Number(job.depth) || 0) - 1),
+          // The woken turn's output is the waiter's own note, NOT a reply to the
+          // peer. Filed as a reply it landed in the peer's inbox as "Recibido…",
+          // the peer answered "Confirmado…", and one status report became a
+          // four-message ping-pong of full tool loops (2026-09-23: ~230 a2a
+          // messages in 50 minutes, most of them acknowledgements).
+          wakeFor: job.id,
+        }),
+      );
+
+      // A child wake resumes the manager that owns the OUTER background job.
+      //
+      // If that resumed manager delegated more managed work, its durable
+      // dependency set changed synchronously, so the outer job stays open. If it
+      // did not, this wake completed the orchestration level and the outer job can
+      // now settle and wake its own caller.
+      try {
+        await finishParent({ result: result?.text || "", completeTurn: true });
+      } catch (e) {
+        // The turn ran once and is never re-run. What a settlement write that
+        // failed owes the parent is the failure itself, not a silent close.
+        const reason = `managed lifecycle persistence failure: ${e?.message || e}`;
+        try {
+          await finishParent({ failure: reason, completeTurn: true });
+        } catch { /* the record keeps whatever the first attempt wrote */ }
+        return { delivered: false, reason };
+      }
+
+      return { delivered: true };
+    } catch (e) {
+      const reason = e?.message || String(e);
+      try {
+        await finishParent({ failure: reason, completeTurn: true });
+      } catch { /* ownership was already released; the record keeps what landed */ }
+      // The waiter did not wake. Say so where it can be seen rather than
+      // swallowing it — the job record already holds the result, so nothing is
+      // lost except the nudge, and the thread still carries the peer's answer.
+      return { delivered: false, reason };
+    }
+  } finally {
+    clearPendingManagedWake(job.id);
   }
 }
 

@@ -3,12 +3,16 @@
 // a completed child from starting a second turn while its owner is still live.
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  closeJob, readJob, updateJob, TERMINAL_STATUSES,
+  closeJob, readJob, updateJob, wakeClaimed, TERMINAL_STATUSES,
 } from "#core/stores/background-jobs.js";
 
 const managedBackgroundContext = new AsyncLocalStorage();
 const activeTurns = new Map();
 const continuationLocks = new Map();
+// Child job ids whose wake was claimed and is still delivering. A dependency
+// on one of those is live bookkeeping; only a claimed child with NO delivery
+// in flight can be an orphan left by a failed release write.
+const pendingManagedWakes = new Set();
 
 function newLatch(jobId) {
   let resolve;
@@ -29,6 +33,35 @@ function releaseLatch(jobId) {
 /** Release only in-memory ownership; durable lifecycle state is persisted separately. */
 export function releaseManagedTurnOwnership(jobId) {
   if (jobId) releaseLatch(jobId);
+}
+
+/** Any in-memory owner for this job — a live turn latch or a queued continuation. */
+export function hasManagedOwner(jobId) {
+  const key = String(jobId);
+  return activeTurns.has(key) || continuationLocks.has(key);
+}
+
+/** Mark/clear the in-flight delivery of a child's claimed wake. */
+export function markPendingManagedWake(childJobId) {
+  if (childJobId) pendingManagedWakes.add(String(childJobId));
+}
+
+export function clearPendingManagedWake(childJobId) {
+  pendingManagedWakes.delete(String(childJobId));
+}
+
+/**
+ * A dependency is stale when its child can no longer release it: the record
+ * is gone, or the child ended with its wake claimed and no delivery still in
+ * flight. A claimed child mid-wake — queued behind the parent's latch — is
+ * deliberately NOT stale: pruning it would close the parent before its result
+ * is consumed.
+ */
+function staleDependencyId(childId, child = readJob(childId)) {
+  if (!child) return true;
+  if (!TERMINAL_STATUSES.includes(child.status)) return false;
+  if (!wakeClaimed(childId)) return false;
+  return !pendingManagedWakes.has(String(childId));
 }
 
 async function withContinuationLock(jobId, fn) {
@@ -189,13 +222,29 @@ export function settleManagedDependency({
   }
 
   const childId = String(childJobId);
-  const remaining = managedDependencyIds(parent).filter((id) => id !== childId);
   const failures = Array.isArray(parent.managed_dependency_failures)
     ? [...parent.managed_dependency_failures]
     : [];
-  if (failure && !failures.some((entry) => entry?.job_id === childId)) {
-    failures.push({ job_id: childId, reason: String(failure).slice(0, 2000) });
-  }
+  const recordFailure = (id, reason) => {
+    if (!failures.some((entry) => entry?.job_id === id)) {
+      failures.push({ job_id: id, reason: String(reason).slice(0, 2000) });
+    }
+  };
+  if (failure) recordFailure(childId, failure);
+
+  // Rewriting the list is also the first chance to drop rows a failed release
+  // write left behind: children that already ended with their wake spent.
+  // Keeping them would park the parent on finished work until its deadline.
+  const remaining = managedDependencyIds(parent).filter((id) => {
+    if (id === childId) return false;
+    const child = readJob(id);
+    if (!staleDependencyId(id, child)) return true;
+    if (!child) recordFailure(id, "dependency record is gone");
+    else if (child.status !== "done") {
+      recordFailure(id, `ended ${child.status} before its dependency could be released`);
+    }
+    return false;
+  });
 
   const updated = updateJob(parent.id, {
     managed_dependency_ids: remaining,
@@ -204,4 +253,19 @@ export function settleManagedDependency({
   });
   const settled = settleIfReady(updated);
   return { parent: settled || updated, settled };
+}
+
+/**
+ * Drop dependencies whose release write never landed — the reconcile sweep's
+ * hook for a parent with no continuation left to retry the settle itself.
+ */
+export function reconcileManagedDependencies(parentJobId) {
+  const parent = readJob(parentJobId);
+  if (!parent || TERMINAL_STATUSES.includes(parent.status)) {
+    return { parent, settled: null };
+  }
+  const stale = managedDependencyIds(parent).find((id) => staleDependencyId(id));
+  if (!stale) return { parent, settled: null };
+  // Any stale id settles them all: the release recomputes the whole list.
+  return settleManagedDependency({ parentJobId, childJobId: stale });
 }
