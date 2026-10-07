@@ -278,6 +278,59 @@ test("multiple managed shells keep the parent open until the final dependency co
   assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
 });
 
+test("simultaneous managed shell wakes take parent ownership one at a time", async () => {
+  fresh();
+  const calls = [];
+  const shells = [];
+  const gates = [deferred(), deferred()];
+  const started = [deferred(), deferred()];
+  let activeTurns = 0;
+  let maxActiveTurns = 0;
+  const messagePeerFn = async (args) => {
+    calls.push(args);
+    if (!args.wakeFor) {
+      shells.push(launchShell({ from: "napoleon", command: "echo first" }));
+      shells.push(launchShell({ from: "napoleon", command: "echo second" }));
+      return { text: "Two commands running.", thread: "t" };
+    }
+    return { text: "caller received final result", thread: "t" };
+  };
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "run concurrently",
+    wake: true, messagePeerFn,
+  });
+  await until(() => shells.length === 2, "both shells to launch");
+  await until(() => readJob(parent.job_id)?.managed_turn_active === false, "owner turn to end");
+  for (const shell of shells) shell.child.emit("close", 0, null);
+  await until(() => shells.every((shell) => readJob(shell.launched.job_id)?.status === "done"), "both shells to finish");
+
+  let wakeIndex = 0;
+  const runChatTurnFn = async () => {
+    const index = wakeIndex++;
+    activeTurns++;
+    maxActiveTurns = Math.max(maxActiveTurns, activeTurns);
+    started[index].resolve();
+    await gates[index].promise;
+    activeTurns--;
+    return { text: index === 0 ? "First handled." : "DONE: both handled" };
+  };
+  const wakes = shells.map((shell) => wakeShellJob(readJob(shell.launched.job_id), {
+    projects: PROJECTS, runChatTurnFn, messagePeerFn,
+  }));
+  await started[0].promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(wakeIndex, 1, "the second wake waits for ownership");
+  gates[0].resolve();
+  await started[1].promise;
+  assert.equal(readJob(parent.job_id).status, "running");
+  gates[1].resolve();
+  await Promise.all(wakes);
+
+  assert.equal(maxActiveTurns, 1);
+  assert.equal(readJob(parent.job_id).status, "done");
+  assert.equal(parentWakeCalls(calls, parent.job_id).length, 1);
+});
+
 test("independent and wake-false shell jobs never become managed dependencies", async () => {
   fresh();
   const independent = launchShell({ from: "napoleon" });

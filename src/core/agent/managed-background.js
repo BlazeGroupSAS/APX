@@ -8,6 +8,7 @@ import {
 
 const managedBackgroundContext = new AsyncLocalStorage();
 const activeTurns = new Map();
+const continuationLocks = new Map();
 
 function newLatch(jobId) {
   let resolve;
@@ -23,6 +24,21 @@ function releaseLatch(jobId) {
   if (!latch) return;
   activeTurns.delete(key);
   latch.resolve();
+}
+
+async function withContinuationLock(jobId, fn) {
+  const key = String(jobId);
+  const previous = continuationLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((done) => { release = done; });
+  continuationLocks.set(key, current);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (continuationLocks.get(key) === current) continuationLocks.delete(key);
+  }
 }
 
 /** Register the already-open initial owner turn before detached work starts. */
@@ -107,29 +123,31 @@ export async function waitForManagedTurn(parentJobId) {
 /** Acquire the next serialized continuation, unless the prior owner failed. */
 export async function beginManagedContinuation(parentJobId) {
   if (!parentJobId) return { acquired: false, parent: null, reason: "no managed parent" };
-  const waited = await waitForManagedTurn(parentJobId);
-  let parent = waited.parent;
-  if (!parent || TERMINAL_STATUSES.includes(parent.status)) {
-    return { acquired: false, parent, reason: parent ? `parent already ${parent.status}` : "parent missing" };
-  }
-  if (waited.orphaned) {
-    const failed = completeManagedTurn({
-      parentJobId,
-      status: "failed",
-      result: "managed owner turn was lost before its dependency wake could resume",
+  return withContinuationLock(parentJobId, async () => {
+    const waited = await waitForManagedTurn(parentJobId);
+    let parent = waited.parent;
+    if (!parent || TERMINAL_STATUSES.includes(parent.status)) {
+      return { acquired: false, parent, reason: parent ? `parent already ${parent.status}` : "parent missing" };
+    }
+    if (waited.orphaned) {
+      const failed = completeManagedTurn({
+        parentJobId,
+        status: "failed",
+        result: "managed owner turn was lost before its dependency wake could resume",
+      });
+      return { acquired: false, parent: failed.parent, settled: failed.settled, reason: "managed owner turn lost" };
+    }
+    const outcome = parent.managed_turn_outcome;
+    if (outcome?.status && outcome.status !== "done") {
+      return { acquired: false, parent, reason: outcome.result || `owner ended ${outcome.status}` };
+    }
+    parent = updateJob(parent.id, {
+      managed_turn_active: true,
+      managed_turn_outcome: null,
     });
-    return { acquired: false, parent: failed.parent, settled: failed.settled, reason: "managed owner turn lost" };
-  }
-  const outcome = parent.managed_turn_outcome;
-  if (outcome?.status && outcome.status !== "done") {
-    return { acquired: false, parent, reason: outcome.result || `owner ended ${outcome.status}` };
-  }
-  parent = updateJob(parent.id, {
-    managed_turn_active: true,
-    managed_turn_outcome: null,
+    registerManagedTurn(parentJobId);
+    return { acquired: true, parent };
   });
-  registerManagedTurn(parentJobId);
-  return { acquired: true, parent };
 }
 
 /** Persist an owner result, release waiters, and settle only when children are gone. */
