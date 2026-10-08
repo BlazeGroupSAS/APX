@@ -26,14 +26,13 @@
 // the failure worth spending a syscall on.
 import { emitBackgroundJobEvent, onBackgroundJobEvent } from "#core/events/bus.js";
 import { claimWake, jobKind, JOB_KINDS } from "#core/stores/background-jobs.js";
-import { shellWakeText } from "#core/agent/shell/background.js";
+import { shellWakeText, resolveWakeAgent } from "#core/agent/shell/background.js";
 import { deliverWake } from "#core/agent/a2a/background.js";
 import {
   beginManagedContinuation, clearPendingManagedWake, completeManagedTurn,
   markPendingManagedWake, releaseManagedTurnOwnership, runInManagedBackground,
   settleManagedDependency,
 } from "#core/agent/managed-background.js";
-import { readAgents } from "#core/apc/parser.js";
 import { resolveAgentModel } from "#core/agent/agent-model.js";
 import { CHANNELS } from "#core/constants/channels.js";
 import { runChatTurn } from "./agent-chat-turn.js";
@@ -165,10 +164,9 @@ async function wakeShellJobImpl(job, {
     return { woken: false, reason: "project gone" };
   }
 
-  let agent = null;
-  try {
-    agent = readAgents(project.path).find((a) => a.slug === job.from) || null;
-  } catch { /* an unreadable roster is the same as a missing agent */ }
+  // The same predicate the launcher applied when the job was born
+  // (resolveWakeAgent): this project's roster, this slug — nowhere else.
+  const agent = resolveWakeAgent(project, job.from);
   if (!agent) {
     log?.(`shell-job-wake: cannot wake ${job.from} for ${job.id} — no such agent in ${project.id}`);
     await settleManagedShellDependency(job, {

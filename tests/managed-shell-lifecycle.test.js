@@ -16,11 +16,15 @@ const {
   cancelJob, deliverWake, MAX_BACKGROUND_DEPTH, sendInBackground,
 } = await import("#core/agent/a2a/background.js");
 const sendToAgent = (await import("#core/agent/tools/handlers/send-to-agent.js")).default;
-const { runShellInBackground } = await import("#core/agent/shell/background.js");
+const { runShellInBackground, resolveWakeAgent } = await import("#core/agent/shell/background.js");
+const { default: runShell } = await import("#core/agent/tools/handlers/run-shell.js");
 const {
-  BACKGROUND_JOBS_DIR, closeJob, readJob, wakeClaimed, TERMINAL_STATUSES,
+  BACKGROUND_JOBS_DIR, closeJob, listJobs, readJob, wakeClaimed, TERMINAL_STATUSES,
 } = await import("#core/stores/background-jobs.js");
-const { settleManagedDependency } = await import("#core/agent/managed-background.js");
+const {
+  settleManagedDependency, runInManagedBackground,
+} = await import("#core/agent/managed-background.js");
+const { scopeProjects } = await import("#core/apc/projects-helpers.js");
 const { startShellJobWake, wakeShellJob } = await import("#host/daemon/shell-job-wake.js");
 const { reconcileBackgroundJobs } = await import("#host/daemon/background-jobs-reconciler.js");
 
@@ -42,6 +46,41 @@ const PROJECT = {
 };
 fs.mkdirSync(PROJECT.storagePath, { recursive: true });
 const PROJECTS = { get: () => PROJECT, list: () => [PROJECT], rebuild: () => {} };
+
+// A second, unrelated project — its roster does NOT contain the agents above —
+// and a default project that does contain one. A job that asks to be woken can
+// only be born in a project whose roster resolves `from`, which is the rule the
+// last block of tests exercises.
+const OTHER_ROOT = makeTempProject({
+  name: "acme-remote",
+  agents: [{ slug: "zoya", role: "Worker", model: "openai:test-model" }],
+});
+const OTHER = {
+  id: 92,
+  name: "acme-remote",
+  path: OTHER_ROOT,
+  storagePath: path.join(TMP_HOME, "store-remote"),
+  config: {},
+};
+const DEFAULT_ROOT = makeTempProject({
+  name: "default",
+  agents: [{ slug: "milo", role: "Helper", model: "openai:test-model" }],
+});
+const DEFAULT_P0 = {
+  id: 0,
+  name: "default",
+  path: DEFAULT_ROOT,
+  storagePath: path.join(TMP_HOME, "store-default"),
+  config: {},
+};
+fs.mkdirSync(OTHER.storagePath, { recursive: true });
+fs.mkdirSync(DEFAULT_P0.storagePath, { recursive: true });
+const BY_ID = new Map([[PROJECT.id, PROJECT], [OTHER.id, OTHER], [DEFAULT_P0.id, DEFAULT_P0]]);
+const THREE_PROJECTS = {
+  get: (id) => BY_ID.get(Number(id)) || null,
+  list: () => [...BY_ID.values()],
+  rebuild: () => {},
+};
 
 let nextPid = 8100;
 
@@ -1001,4 +1040,155 @@ test("N5: the reconciler closes a managed owner whose outcome write never landed
   assert.equal(after.status, "failed", "an owner nobody holds is closed, not waited on");
   assert.deepEqual(after.managed_dependency_ids, []);
   assert.equal(TERMINAL_STATUSES.includes(after.status), true);
+});
+
+// P-series: the project a wakeable shell is born into. The real E2E failure
+// was a managed shell persisted with project_id 0 while its managed parent
+// lived in project 1 — a record whose `from` could never be resolved by its
+// own wake-up. The contract under test: the job's project is the turn's
+// project unless an explicit, valid cross-project launch names another.
+
+/** The tool context run-turn.js hands the model inside a managed a2a turn. */
+function managedShellCtx({ projects = THREE_PROJECTS, agentSlug = "napoleon", depth = 1 } = {}) {
+  return {
+    projects: scopeProjects(projects, PROJECT.id),
+    channel: "a2a",
+    channelMeta: { agentSlug, a2aDepth: depth },
+    requirePermission: async () => {},
+  };
+}
+
+test("P1: a managed shell launched inside an a2a turn keeps the turn's project", async () => {
+  fresh();
+  let shellOut = null;
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "work",
+    wake: true,
+    messagePeerFn: async (args) => {
+      if (args.wakeFor) return { text: "done", thread: "t" };
+      // Inside napoleon's managed turn, the real handler over the real
+      // project-scoped registry — the same ctx run-turn.js builds for it.
+      shellOut = await runShell.makeHandler(managedShellCtx())({
+        command: "echo work", background: true,
+      });
+      return { text: "launched", thread: "t" };
+    },
+  });
+  await until(() => shellOut, "the shell to launch");
+
+  const rec = readJob(shellOut.job_id);
+  assert.equal(rec.project_id, PROJECT.id, "the turn's project, not the default");
+  assert.equal(rec.parent_job_id, parent.job_id, "still a dependency of the managed parent");
+  assert.equal(rec.from, "napoleon");
+  assert.equal(rec.wake, true);
+  assert.equal(rec.cwd, path.resolve(PROJECT.path));
+  await until(
+    () => TERMINAL_STATUSES.includes(readJob(rec.id)?.status),
+    "the launched command to settle",
+  );
+});
+
+test("P2: a wakeable shell naming a project without its agent is refused, not born lost", async () => {
+  fresh();
+  // napoleon lives in PROJECT's roster only. An explicit `project` argument
+  // pointing at a roster that cannot resolve him produces a job whose wake-up
+  // could never fire — the exact record the real E2E carried. Refused BEFORE
+  // it is persisted, with a reason the model can act on.
+  const out = await runShell.makeHandler(managedShellCtx())({
+    command: "echo hi", background: true, wake_me: true, project: "acme-remote",
+  });
+  assert.match(out.error || "", /cannot be woken/);
+  assert.equal(out.job_id, undefined, "no record was born");
+  assert.equal(listJobs({}).length, 0, "and no orphan is left for a parent to hold");
+});
+
+test("P3: an explicit cross-project launch still works where the agent resolves", async () => {
+  fresh();
+  // zoya IS in acme-remote's roster: an explicit, valid cross-project launch
+  // is not what the guard refuses — only an unresolvable one is.
+  const launched = runShellInBackground({
+    project: OTHER, from: "zoya", command: "echo remote",
+    cwd: OTHER_ROOT, wake: true, depth: 1,
+    origin: { channel: "a2a", conversation_id: null },
+  });
+  assert.ok(launched.job_id, launched.error);
+  const rec = readJob(launched.job_id);
+  assert.equal(rec.project_id, OTHER.id);
+  await until(() => readJob(rec.id)?.status === "done", "remote shell to finish");
+
+  let turn = null;
+  const wake = await wakeShellJob(readJob(rec.id), {
+    projects: THREE_PROJECTS,
+    runChatTurnFn: async (args) => { turn = args; return { conversation_id: "zoya-chat", text: "done" }; },
+    messagePeerFn: async () => ({ text: "ack", thread: "t" }),
+  });
+  assert.equal(wake.woken, true, "the wake resolves zoya in the job's own project");
+  assert.equal(turn.p.id, OTHER.id);
+});
+
+test("P4: a shell legitimately launched in the default project keeps project_id 0", async () => {
+  fresh();
+  const launched = runShellInBackground({
+    project: DEFAULT_P0, from: "milo", command: "echo home",
+    cwd: DEFAULT_ROOT, wake: true,
+    origin: { channel: "api", conversation_id: null },
+  });
+  assert.ok(launched.job_id, launched.error);
+  const rec = readJob(launched.job_id);
+  assert.equal(rec.project_id, 0, "the default project's id is still 0, not rewritten");
+  await until(() => readJob(rec.id)?.status === "done", "default shell to finish");
+
+  let turn = null;
+  const wake = await wakeShellJob(readJob(rec.id), {
+    projects: THREE_PROJECTS,
+    runChatTurnFn: async (args) => { turn = args; return { conversation_id: "milo-chat", text: "done" }; },
+    messagePeerFn: async () => ({ text: "ack", thread: "t" }),
+  });
+  assert.equal(wake.woken, true);
+  assert.equal(turn.p.id, 0);
+});
+
+test("P5: a shell launched inside a managed continuation keeps parent and project", async () => {
+  fresh();
+  // Hold the initial turn open until the dependency is attached — the managed
+  // context below is the same one a woken continuation re-enters, and the
+  // attach has to land while the parent is still open.
+  let releaseTurn;
+  const turnGate = new Promise((r) => { releaseTurn = r; });
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "orchestrate",
+    wake: true,
+    messagePeerFn: async (args) => {
+      if (args.wakeFor) return { text: "done", thread: "t" };
+      await turnGate;
+      return { text: "opened", thread: "t" };
+    },
+  });
+  await until(() => readJob(parent.job_id), "the parent record");
+
+  let shellOut = null;
+  await runInManagedBackground(parent.job_id, async () => {
+    shellOut = await runShell.makeHandler(managedShellCtx())({
+      command: "echo continued", background: true,
+    });
+  });
+  releaseTurn();
+  const rec = readJob(shellOut.job_id);
+  assert.equal(rec.project_id, PROJECT.id);
+  assert.equal(rec.parent_job_id, parent.job_id);
+  assert.deepEqual(readJob(parent.job_id).managed_dependency_ids, [rec.id]);
+  await until(
+    () => TERMINAL_STATUSES.includes(readJob(rec.id)?.status),
+    "the launched command to settle",
+  );
+});
+
+test("P6: the wake-side resolver shares the launcher's predicate", () => {
+  // One roster read, two uses: runShellInBackground refuses a job it could
+  // never wake, and shell-job-wake resolves the agent the same way when a
+  // legitimate one ends. Keeping them the same predicate is what makes a
+  // refusal at birth and a failure at delivery mean the same thing.
+  assert.equal(resolveWakeAgent(OTHER, "zoya")?.slug, "zoya");
+  assert.equal(resolveWakeAgent(OTHER, "napoleon"), null);
+  assert.equal(resolveWakeAgent(PROJECT, "napoleon")?.slug, "napoleon");
 });

@@ -45,6 +45,21 @@ import { emitBackgroundJobEvent } from "#core/events/bus.js";
 import {
   attachManagedDependency, managedParentJobId,
 } from "#core/agent/managed-background.js";
+import { readAgents } from "#core/apc/parser.js";
+
+/**
+ * The agent a finished job's wake-up can actually reach, or null. The wake
+ * resolves `from` in the job's own project roster and nowhere else — a roster
+ * that cannot be read resolves nobody, the same verdict the daemon's
+ * shell-job-wake.js applies when it reads it again at delivery time.
+ */
+export function resolveWakeAgent(project, from) {
+  try {
+    return readAgents(project?.path).find((a) => a.slug === from) || null;
+  } catch {
+    return null;
+  }
+}
 
 /** The longest a background command may run. Six hours: long enough for a batch
  *  render nobody wants to babysit, short enough that a hung process is reaped
@@ -181,6 +196,19 @@ export function runShellInBackground({
   if (!project) return { error: "background shell: no project" };
   if (!from) return { error: "background shell: no agent to wake" };
   if (!command) return { error: "background shell: command required" };
+
+  // The wake resolves `from` exactly this way later: this project's roster,
+  // this slug. A record that asks to be woken from a project that cannot
+  // resolve the name is born already lost — a managed parent would hold a
+  // dependency whose only possible report is "agent is gone".
+  if (wake && !resolveWakeAgent(project, from)) {
+    return {
+      error:
+        `background shell: ${from} cannot be woken in ${project.name || `project ${project.id ?? "?"}`} — ` +
+        `the wake-up resolves the launching agent only in the job's own project roster, and ${from} is not in it. ` +
+        `Launch it in the project where ${from} is an agent, or pass wake_me: false if nobody needs the result.`,
+    };
+  }
 
   const open = countOpenJobs({ project_id: project.id ?? null, from, kind: JOB_KINDS.SHELL });
   if (open >= MAX_OPEN_JOBS_PER_AGENT) {

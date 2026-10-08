@@ -31,6 +31,14 @@ const { default: runShell } = await import("#core/agent/tools/handlers/run-shell
 
 const PROJECT = { id: 7, name: "acme", path: TMP_HOME, storagePath: TMP_HOME, config: {} };
 
+// A job that asks to be woken can only be born where `from` resolves — the
+// wake reads this roster, and only this roster. reels/lumen are the agents
+// these tests launch as, so the project has to actually contain them.
+fs.mkdirSync(path.join(TMP_HOME, ".apc", "agents"), { recursive: true });
+for (const slug of ["reels", "lumen"]) {
+  fs.writeFileSync(path.join(TMP_HOME, ".apc", "agents", `${slug}.md`), `---\nrole: Worker\n---\n`);
+}
+
 function fresh() {
   try { fs.rmSync(BACKGROUND_JOBS_DIR, { recursive: true, force: true }); } catch { /* nothing there */ }
 }
