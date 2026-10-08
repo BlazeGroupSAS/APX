@@ -61,6 +61,21 @@ export function resolveWakeAgent(project, from) {
   }
 }
 
+/**
+ * The entry the daemon will hand this job's wake-up — the registry's record
+ * for `project.id`, not necessarily the `project` object the caller passed. A
+ * turn may hold a scoped VIEW (scopeProjectsToWorkdir rewrites `path` to the
+ * session's workdir, which can live outside the project root), and while the
+ * job still belongs to the logical project, its roster lives at the real root.
+ * `list()` is the one accessor no scope shadows, so it is the honest way back
+ * to the canonical entry — the same one `projects.get(job.project_id)` reads
+ * again at delivery time.
+ */
+function rosterProject(projects, project) {
+  if (typeof projects?.list !== "function") return project;
+  return projects.list().find((e) => String(e.id) === String(project?.id)) || null;
+}
+
 /** The longest a background command may run. Six hours: long enough for a batch
  *  render nobody wants to babysit, short enough that a hung process is reaped
  *  the same day it hangs. */
@@ -183,6 +198,7 @@ export function shellWakeText(job) {
  */
 export function runShellInBackground({
   project,
+  projects,
   from,
   command,
   cwd,
@@ -197,11 +213,14 @@ export function runShellInBackground({
   if (!from) return { error: "background shell: no agent to wake" };
   if (!command) return { error: "background shell: command required" };
 
-  // The wake resolves `from` exactly this way later: this project's roster,
-  // this slug. A record that asks to be woken from a project that cannot
-  // resolve the name is born already lost — a managed parent would hold a
-  // dependency whose only possible report is "agent is gone".
-  if (wake && !resolveWakeAgent(project, from)) {
+  // The wake resolves `from` exactly this way later: the roster of the
+  // project the job's id names, this slug. A record that asks to be woken
+  // from a project that cannot resolve the name is born already lost — a
+  // managed parent would hold a dependency whose only possible report is
+  // "agent is gone". `rosterProject` because `project` may be a scoped view
+  // whose `path` is a workdir outside the real root; the roster lives at the
+  // canonical entry, and so does this check.
+  if (wake && !resolveWakeAgent(rosterProject(projects, project), from)) {
     return {
       error:
         `background shell: ${from} cannot be woken in ${project.name || `project ${project.id ?? "?"}`} — ` +

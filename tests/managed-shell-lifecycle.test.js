@@ -24,7 +24,7 @@ const {
 const {
   settleManagedDependency, runInManagedBackground,
 } = await import("#core/agent/managed-background.js");
-const { scopeProjects } = await import("#core/apc/projects-helpers.js");
+const { scopeProjects, scopeProjectsToWorkdir } = await import("#core/apc/projects-helpers.js");
 const { startShellJobWake, wakeShellJob } = await import("#host/daemon/shell-job-wake.js");
 const { reconcileBackgroundJobs } = await import("#host/daemon/background-jobs-reconciler.js");
 
@@ -107,6 +107,7 @@ function launchShell({
   const child = fakeChild();
   const launched = runShellInBackground({
     project: PROJECT,
+    projects: PROJECTS,
     from,
     command,
     cwd: ROOT,
@@ -1088,18 +1089,46 @@ test("P1: a managed shell launched inside an a2a turn keeps the turn's project",
   );
 });
 
-test("P2: a wakeable shell naming a project without its agent is refused, not born lost", async () => {
+test("T2: a managed launch into a roster that cannot resolve the agent leaves no trace", async () => {
   fresh();
-  // napoleon lives in PROJECT's roster only. An explicit `project` argument
-  // pointing at a roster that cannot resolve him produces a job whose wake-up
-  // could never fire — the exact record the real E2E carried. Refused BEFORE
-  // it is persisted, with a reason the model can act on.
-  const out = await runShell.makeHandler(managedShellCtx())({
-    command: "echo hi", background: true, wake_me: true, project: "acme-remote",
+  // The refusal has to happen inside a real managed context and leave zero
+  // bookkeeping behind: no job record, no managed dependency, no wake claim.
+  let out = null;
+  let releaseTurn;
+  const turnGate = new Promise((r) => { releaseTurn = r; });
+  const parent = sendInBackground({
+    project: PROJECT, from: "charly", to: "napoleon", body: "work",
+    wake: true,
+    messagePeerFn: async (args) => {
+      if (args.wakeFor) return { text: "done", thread: "t" };
+      await turnGate;
+      return { text: "opened", thread: "t" };
+    },
+  });
+  await until(() => readJob(parent.job_id), "the parent record");
+
+  await runInManagedBackground(parent.job_id, async () => {
+    out = await runShell.makeHandler(managedShellCtx())({
+      command: "echo hi", background: true, wake_me: true, project: "acme-remote",
+    });
   });
   assert.match(out.error || "", /cannot be woken/);
   assert.equal(out.job_id, undefined, "no record was born");
-  assert.equal(listJobs({}).length, 0, "and no orphan is left for a parent to hold");
+  assert.deepEqual(
+    listJobs({}).filter((j) => j.id !== parent.job_id).map((j) => j.id), [],
+    "no orphan shell is left for the parent to hold",
+  );
+  assert.deepEqual(readJob(parent.job_id).managed_dependency_ids, [], "the parent holds nothing");
+  assert.equal(
+    fs.readdirSync(BACKGROUND_JOBS_DIR).filter((f) => f.endsWith(".wake")).length, 0,
+    "and no wake claim exists",
+  );
+
+  releaseTurn();
+  await until(
+    () => readJob(parent.job_id)?.status === "done",
+    "the refused launch leaves the parent free to close",
+  );
 });
 
 test("P3: an explicit cross-project launch still works where the agent resolves", async () => {
@@ -1107,7 +1136,7 @@ test("P3: an explicit cross-project launch still works where the agent resolves"
   // zoya IS in acme-remote's roster: an explicit, valid cross-project launch
   // is not what the guard refuses — only an unresolvable one is.
   const launched = runShellInBackground({
-    project: OTHER, from: "zoya", command: "echo remote",
+    project: OTHER, projects: THREE_PROJECTS, from: "zoya", command: "echo remote",
     cwd: OTHER_ROOT, wake: true, depth: 1,
     origin: { channel: "a2a", conversation_id: null },
   });
@@ -1126,15 +1155,18 @@ test("P3: an explicit cross-project launch still works where the agent resolves"
   assert.equal(turn.p.id, OTHER.id);
 });
 
-test("P4: a shell legitimately launched in the default project keeps project_id 0", async () => {
+test("T4: an agent of the default project launches and wakes there", async () => {
   fresh();
-  const launched = runShellInBackground({
-    project: DEFAULT_P0, from: "milo", command: "echo home",
-    cwd: DEFAULT_ROOT, wake: true,
-    origin: { channel: "api", conversation_id: null },
-  });
-  assert.ok(launched.job_id, launched.error);
-  const rec = readJob(launched.job_id);
+  // milo lives in the default project's roster — a turn scoped to it must be
+  // able to launch a wakeable shell that keeps project_id 0 end to end.
+  const out = await runShell.makeHandler({
+    projects: scopeProjects(THREE_PROJECTS, DEFAULT_P0.id),
+    channel: "api",
+    channelMeta: { agentSlug: "milo" },
+    requirePermission: async () => {},
+  })({ command: "echo home", background: true });
+  assert.ok(out.job_id, out.error);
+  const rec = readJob(out.job_id);
   assert.equal(rec.project_id, 0, "the default project's id is still 0, not rewritten");
   await until(() => readJob(rec.id)?.status === "done", "default shell to finish");
 
@@ -1191,4 +1223,97 @@ test("P6: the wake-side resolver shares the launcher's predicate", () => {
   assert.equal(resolveWakeAgent(OTHER, "zoya")?.slug, "zoya");
   assert.equal(resolveWakeAgent(OTHER, "napoleon"), null);
   assert.equal(resolveWakeAgent(PROJECT, "napoleon")?.slug, "napoleon");
+});
+
+test("T1: a code session rooted outside the project still resolves the project's roster", async () => {
+  fresh();
+  // scopeProjectsToWorkdir hands the session a view whose `path` is the
+  // workdir — possibly outside the project root — while the job still belongs
+  // to the logical project. The roster check must follow the id, not the
+  // view's rewritten path.
+  const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "apx-workdir-"));
+  const scoped = scopeProjectsToWorkdir(THREE_PROJECTS, PROJECT.id, workdir);
+  assert.equal(scoped.current().id, PROJECT.id);
+  assert.notEqual(
+    path.resolve(scoped.current().path), path.resolve(ROOT),
+    "the view's path really is the external workdir",
+  );
+
+  const out = await runShell.makeHandler({
+    projects: scoped,
+    channel: "code",
+    channelMeta: { agentSlug: "napoleon" },
+    requirePermission: async () => {},
+  })({ command: "echo scoped", background: true });
+  assert.ok(out.job_id, out.error);
+  const rec = readJob(out.job_id);
+  assert.equal(rec.project_id, PROJECT.id, "the job belongs to the logical project");
+  assert.equal(rec.cwd, path.resolve(workdir), "the command still runs in the session workdir");
+  await until(() => readJob(rec.id)?.status === "done", "the scoped shell to finish");
+
+  let turn = null;
+  const wake = await wakeShellJob(readJob(rec.id), {
+    projects: THREE_PROJECTS,
+    runChatTurnFn: async (args) => { turn = args; return { conversation_id: "napoleon-chat", text: "done" }; },
+    messagePeerFn: async () => ({ text: "ack", thread: "t" }),
+  });
+  assert.equal(wake.woken, true, "the wake resolves napoleon in the real roster");
+  assert.equal(turn.p.id, PROJECT.id);
+});
+
+test("T3: an explicit default target from a foreign agent is refused — the real incident", async () => {
+  fresh();
+  // The record the real E2E produced: napoleon lives in PROJECT, yet the shell
+  // was persisted against the default project's roster, where no wake could
+  // ever find him. Both spellings of the default project must refuse before a
+  // job exists.
+  for (const target of ["default", "0"]) {
+    const out = await runShell.makeHandler(managedShellCtx())({
+      command: "echo hi", background: true, project: target,
+    });
+    assert.match(out.error || "", /cannot be woken/, target);
+    assert.equal(out.job_id, undefined, target);
+  }
+  assert.equal(listJobs({}).length, 0, "no orphan is left for a parent to hold");
+});
+
+test("T5: wake_me:false launches where the roster cannot resolve the agent", async () => {
+  fresh();
+  // No wake, no roster requirement: napoleon may run a command in acme-remote
+  // as long as nobody has to be brought back there.
+  const out = await runShell.makeHandler(managedShellCtx())({
+    command: "echo quiet", background: true, wake_me: false, project: "acme-remote",
+  });
+  assert.ok(out.job_id, out.error);
+  const rec = readJob(out.job_id);
+  assert.equal(rec.project_id, OTHER.id);
+  assert.equal(rec.wake, false);
+  await until(() => TERMINAL_STATUSES.includes(readJob(rec.id)?.status), "the quiet shell to settle");
+});
+
+test("T6: a roster that changes between launch and delivery still fails honestly", async () => {
+  fresh();
+  // The early check is not a promise: napoleon exists at launch, is removed
+  // before the shell ends, and the delivery-time read has the last word.
+  const agentFile = path.join(ROOT, ".apc", "agents", "napoleon.md");
+  const saved = fs.readFileSync(agentFile, "utf8");
+  try {
+    const { child, launched } = launchShell({ from: "napoleon" });
+    assert.ok(launched.job_id, launched.error);
+    fs.rmSync(agentFile);
+    child.emit("close", 0, null);
+    await until(() => readJob(launched.job_id)?.status === "done", "shell to finish");
+
+    let turns = 0;
+    const wake = await wakeShellJob(readJob(launched.job_id), {
+      projects: PROJECTS,
+      runChatTurnFn: async () => { turns++; return { text: "unreachable" }; },
+      messagePeerFn: async () => ({ text: "ack", thread: "t" }),
+    });
+    assert.equal(wake.woken, false);
+    assert.equal(wake.reason, "agent gone");
+    assert.equal(turns, 0, "no turn may run for an agent that no longer exists");
+  } finally {
+    fs.writeFileSync(agentFile, saved);
+  }
 });

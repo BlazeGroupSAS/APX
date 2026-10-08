@@ -227,6 +227,10 @@ export default {
       const wakeable = !!channelMeta?.agentSlug;
       const launched = runShellInBackground({
         project: p,
+        // The registry goes too: `p` may be a scoped view whose `path` is the
+        // session's workdir, and the wake-roster check belongs to the
+        // canonical project entry, not that view.
+        projects,
         from,
         command,
         cwd: workingDir,
