@@ -104,7 +104,7 @@ export async function firstFrame(sourcePath) {
       "ffmpeg",
       ["-hide_banner", "-loglevel", "error", "-y", "-i", sourcePath,
        "-frames:v", "1", "-f", "image2", target],
-      { env: envWithPath(), timeout: 30_000 }
+      { env: envWithPath(), timeout: 30_000, windowsHide: true }
     );
   } catch {
     return null;

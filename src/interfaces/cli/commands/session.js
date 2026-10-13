@@ -520,6 +520,7 @@ export async function cmdSessionResume(args) {
         const child = spawn(spec.bin, spec.args, {
           cwd: spec.cwd || process.cwd(),
           stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
         });
         let out = "";
         let err = "";

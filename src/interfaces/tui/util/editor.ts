@@ -23,6 +23,9 @@ export async function open(opts: { value: string; renderer: CliRenderer }): Prom
       stdout: "inherit",
       stderr: "inherit",
       shell: process.platform === "win32",
+      // $VISUAL may be a GUI editor (code, notepad) — hiding its window would
+      // leave the caller waiting on an editor nobody can see.
+      windowsHide: false,
     })
     await proc.exited
     const content = await Filesystem.readText(filepath)

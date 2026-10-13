@@ -30,6 +30,7 @@ export default {
       const { stdout } = await execFileAsync("rg", ["-n", "--no-heading", "--color=never", query, target], {
         cwd: p.path,
         maxBuffer: 5 * 1024 * 1024,
+        windowsHide: true,
       });
       return formatResults(stdout);
     } catch (e) {
@@ -38,6 +39,7 @@ export default {
           const { stdout } = await execFileAsync("grep", ["-rn", query, target], {
             cwd: p.path,
             maxBuffer: 5 * 1024 * 1024,
+            windowsHide: true,
           });
           return formatResults(stdout);
         } catch (e2) {

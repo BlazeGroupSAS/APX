@@ -41,7 +41,7 @@ export function isDesktopRunning() { return pidAlive(readPid()); }
 // Validate a candidate actually runs (a pnpm shim can exist as a file while its
 // underlying package was never built — `--version` smokes that out).
 function electronRuns(cmd, argv) {
-  try { execFileSync(cmd, argv, { stdio: "ignore", timeout: 5000 }); return true; } catch { return false; }
+  try { execFileSync(cmd, argv, { stdio: "ignore", timeout: 5000, windowsHide: true }); return true; } catch { return false; }
 }
 
 // Returns a descriptor for buildElectronSpawn(): an absolute electron binary
@@ -55,7 +55,7 @@ export function findElectron() {
   if (fs.existsSync(cli) && electronRuns(process.execPath, [cli, "--version"])) return cli;
 
   try {
-    const which = execFileSync("which", ["electron"], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    const which = execFileSync("which", ["electron"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).toString().trim();
     if (which && electronRuns(which, ["--version"])) return which;
   } catch {}
 
@@ -93,6 +93,9 @@ export async function startDesktopDetached({ port = process.env.APX_PORT || "743
       detached: true,
       stdio: ["ignore", logFd, logFd],
       env: { ...process.env, ELECTRON_ENABLE_LOGGING: "1" },
+      // Electron itself is a GUI app; this suppresses the console window the
+      // npx/cmd shim wrapper would otherwise pop when the descriptor is "npx".
+      windowsHide: true,
     });
   } catch (e) {
     if (typeof logFd === "number") { try { fs.closeSync(logFd); } catch {} }

@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 
 const DEFAULT_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
-export function runProcess({ command, args = [], stdin = "", cwd, env, timeoutMs = DEFAULT_TIMEOUT }) {
+export function runProcess({ command, args = [], stdin = "", cwd, env, timeoutMs = DEFAULT_TIMEOUT, spawnFn = spawn }) {
   return new Promise((resolve) => {
     // `cwd` moves the child's working directory but NOT its inherited `PWD`,
     // which still names wherever the daemon was started. Tools that trust `PWD`
@@ -14,10 +14,11 @@ export function runProcess({ command, args = [], stdin = "", cwd, env, timeoutMs
     const childEnv = { ...process.env, ...(env || {}) };
     if (cwd) childEnv.PWD = cwd;
 
-    const child = spawn(command, args, {
+    const child = spawnFn(command, args, {
       cwd,
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
 
     let stdout = "";

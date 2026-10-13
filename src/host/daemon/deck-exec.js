@@ -30,7 +30,10 @@ function platformOpener() {
 
 function spawnDetached(cmd, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+    // windowsHide only hides a console window for the launcher itself — the
+    // window the opener was asked to show (Finder, a browser, an app) is the
+    // launcher signalling ANOTHER process and is unaffected.
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true, windowsHide: true });
     let settled = false;
     const done = (err) => {
       if (settled) return;
@@ -55,7 +58,7 @@ export async function copyToClipboard(text) {
     "xclip";
   const args = platform === "linux" ? ["-selection", "clipboard"] : [];
   await new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "ignore"] });
+    const child = spawn(cmd, args, { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
     child.on("error", reject);
     child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))));
     child.stdin.end(text);

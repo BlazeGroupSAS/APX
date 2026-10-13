@@ -59,6 +59,10 @@ async function autoStart({ silent = false } = {}) {
     detached: true,
     stdio: ["ignore", out, out],
     env: { ...process.env },
+    // A detached node.exe is a console app: on Windows detached:true would
+    // give the daemon its own console window. The daemon is background by
+    // definition — it must never have one.
+    windowsHide: true,
   });
   child.unref();
   if (!silent) process.stderr.write("apx: starting daemon...\n");

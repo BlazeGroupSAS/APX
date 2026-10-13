@@ -32,7 +32,7 @@ const fmt = {
 // ── System binary discovery ────────────────────────────────────────────────
 function whichSync(bin) {
   try {
-    const out = execFileSync("which", [bin], { stdio: ["ignore", "pipe", "ignore"] })
+    const out = execFileSync("which", [bin], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
       .toString().trim();
     return out || null;
   } catch { return null; }
@@ -66,7 +66,7 @@ function playFile(audioPath, { quiet = false } = {}) {
     }
     return false;
   }
-  const r = spawnSync(player.bin, player.args(audioPath), { stdio: "ignore" });
+  const r = spawnSync(player.bin, player.args(audioPath), { stdio: "ignore", windowsHide: true });
   if (r.status !== 0 && !quiet) {
     console.log(`  ${fmt.y("⚠")} ${player.bin} exited ${r.status}; file at ${audioPath}`);
   }
@@ -114,7 +114,7 @@ function recordToFile(outPath, { seconds, recorder }) {
       return reject(new Error(`unsupported recorder: ${bin}`));
     }
 
-    const proc = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
+    const proc = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
     let stderr = "";
     proc.stderr.on("data", (c) => { stderr += c.toString(); });
 

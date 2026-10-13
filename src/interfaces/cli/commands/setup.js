@@ -355,7 +355,7 @@ export async function cmdSetup() {
   console.log();
   process.stdout.write(`  Starting daemon... `);
 
-  const start = spawnSync("apx", ["daemon", "start"], { encoding: "utf8" });
+  const start = spawnSync("apx", ["daemon", "start"], { encoding: "utf8", windowsHide: true });
   if (start.status !== 0) {
     console.log(c.red + "failed" + c.reset);
     console.log(start.stderr || start.stdout);

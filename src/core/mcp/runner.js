@@ -68,6 +68,7 @@ class McpProcess {
     this.proc = spawn(this.command, this.args, {
       env: envWithPath(this.env),
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
     this.startedAt = nowIso();
 

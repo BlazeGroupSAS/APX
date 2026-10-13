@@ -97,6 +97,7 @@ function defaultRun(file, { cwd, env }) {
     stdio: ["ignore", "pipe", "pipe"],
     timeout: TIMEOUT_MS,
     env: { ...process.env, ...env },
+    windowsHide: true,
   });
 }
 

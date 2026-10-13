@@ -71,6 +71,7 @@ function findAdb() {
   try {
     return execFileSync(process.platform === "win32" ? "where" : "which", ["adb"], {
       encoding: "utf8",
+      windowsHide: true,
     }).split("\n")[0].trim() || null;
   } catch {
     return null;
@@ -79,7 +80,7 @@ function findAdb() {
 
 async function adb(bin, args, { device } = {}) {
   const full = device ? ["-s", device, ...args] : args;
-  const { stdout, stderr } = await run(bin, full, { maxBuffer: 16 * 1024 * 1024 });
+  const { stdout, stderr } = await run(bin, full, { maxBuffer: 16 * 1024 * 1024, windowsHide: true });
   return `${stdout}${stderr}`;
 }
 

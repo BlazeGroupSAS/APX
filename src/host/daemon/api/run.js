@@ -39,7 +39,7 @@ export function register(api, { projects }) {
     execFile(
       "bash",
       ["-c", cmd],
-      { cwd, timeout, maxBuffer: 4 * 1024 * 1024 },
+      { cwd, timeout, maxBuffer: 4 * 1024 * 1024, windowsHide: true },
       (err, stdout, stderr) => {
         const exit_code = err?.code ?? (err ? 1 : 0);
         res.json({

@@ -37,6 +37,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { shellCommand, killChild } from "#core/util/shell.js";
+import { spawnWindowsJob } from "#core/util/win-hidden-run.js";
 import {
   openJob, readJob, updateJob, closeJob, countOpenJobs, jobLogPath,
   JOB_KINDS, MAX_OPEN_JOBS_PER_AGENT, DEFAULT_JOB_TIMEOUT_S, TERMINAL_STATUSES,
@@ -208,6 +209,7 @@ export function runShellInBackground({
   origin = null,
   spawnFn = spawn,
   shellCommandFn = shellCommand,
+  platform = process.platform,
 }) {
   if (!project) return { error: "background shell: no project" };
   if (!from) return { error: "background shell: no agent to wake" };
@@ -274,14 +276,31 @@ export function runShellInBackground({
 
   let child;
   try {
-    child = spawnFn(shell.file, shell.args, {
-      cwd: cwd || undefined,
-      env: process.env,
-      ...shell.options,
-      // Detached so long work can outlive the daemon. killChild handles the
-      // platform-specific tree stop: process group on POSIX, taskkill on Windows.
-      detached: true,
-    });
+    if (platform === "win32" && spawnFn === spawn) {
+      // A Windows job must be hidden AND outlive the daemon AND stay
+      // tree-killable, and no single spawn does all three: detached kills the
+      // console so grandchildren allocate visible ones; non-detached dies
+      // with this process because Node owns non-detached children through a
+      // job object. The detached job host in win-hidden-run.js is the
+      // surviving middle that gives the shell its own hidden console and
+      // relays stdio/exit back over a pipe; its pid is the tree root for
+      // taskkill /T /F, so killChild works unchanged.
+      child = spawnWindowsJob({
+        jobId: job.id, file: shell.file, args: shell.args, options: shell.options, cwd,
+      });
+    } else {
+      child = spawnFn(shell.file, shell.args, {
+        cwd: cwd || undefined,
+        env: process.env,
+        ...shell.options,
+        // Detached so long work can outlive the daemon — and for the POSIX
+        // process group killChild signals. On win32 a detached shell has NO
+        // console and its grandchildren allocate visible ones, so the real
+        // Windows launch goes through the detached job host above; this
+        // branch is what an injected spawnFn (tests) sees there.
+        detached: platform !== "win32",
+      });
+    }
   } catch (e) {
     const settled = closeJob(job.id, { status: "failed", result: `could not start: ${e?.message || e}` });
     emitBackgroundJobEvent({ phase: "end", job: settled || job });

@@ -9,6 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { LOG_DIR } from "#core/config/paths.js";
+import { ensurePickDirScript, normalizePickedPath, wscriptPath } from "#core/util/win-hidden-run.js";
 
 export function register(api, { scheduler, plugins, config, registries }) {
   // Daemon logs: errors.jsonl (structured) or apx.log (plain), newest first.
@@ -90,14 +91,35 @@ export function register(api, { scheduler, plugins, config, registries }) {
       file = "zenity";
       args = ["--file-selection", "--directory", `--title=${prompt}`];
     } else if (platform === "win32") {
-      // Reference the prompt via $env: inside PowerShell rather than splicing it
-      // into the -Command string.
-      file = "powershell";
-      args = [
-        "-NoProfile",
-        "-Command",
-        "$f = (New-Object -ComObject Shell.Application).BrowseForFolder(0, $env:APX_PICK_PROMPT, 0, 0); if ($f) { $f.Self.Path }",
-      ];
+      // BrowseForFolder runs inside wscript — a GUI host, so the tree contains
+      // NO powershell/cmd/conhost and no WindowsTerminal frame; the dialog is
+      // the process's own main window. wscript has no stdout, so the script
+      // writes the picked path to a file. The prompt goes through the
+      // environment, NOT argv: any wscript argument starting with '//' is
+      // eaten by the WSH option parser as a switch — a prompt like "//T:1"
+      // would change WSH's own timeout and never reach the dialog.
+      const result = path.join(os.tmpdir(), `apx-pick-${process.pid}-${Date.now()}.txt`);
+      execFile(
+        wscriptPath(),
+        ["//B", "//Nologo", ensurePickDirScript(), result],
+        { timeout: 5 * 60 * 1000, env },
+        (err) => {
+          let picked = "";
+          try {
+            picked = fs.readFileSync(result, "utf16le").replace(/^\uFEFF/, "").trim();
+          } catch { /* cancelled or failed — no file */ }
+          try { fs.unlinkSync(result); } catch { /* best-effort */ }
+          if (err) {
+            if (err.code === "ENOENT") {
+              return res.status(501).json({ error: "Native folder picker not available" });
+            }
+            return res.status(500).json({ error: err.message });
+          }
+          if (!picked) return res.json({ cancelled: true });
+          res.json({ path: normalizePickedPath(picked) });
+        },
+      );
+      return;
     } else {
       return res.status(501).json({ error: "Native folder picker not supported on this platform" });
     }

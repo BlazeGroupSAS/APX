@@ -242,7 +242,7 @@ export function register(api /*, ctx */) {
       fs.writeFileSync(zipPath, buf);
       const out = path.join(tmp, "out");
       fs.mkdirSync(out);
-      const unzip = spawnSync("unzip", ["-qq", "-o", zipPath, "-d", out], { encoding: "utf8" });
+      const unzip = spawnSync("unzip", ["-qq", "-o", zipPath, "-d", out], { encoding: "utf8", windowsHide: true });
       if (unzip.status !== 0) {
         return res.status(400).json({ error: `unzip failed: ${(unzip.stderr || "bad archive").trim()}` });
       }
@@ -278,6 +278,7 @@ export function register(api /*, ctx */) {
         encoding: "utf8",
         timeout: 60_000,
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        windowsHide: true,
       });
       if (git.status !== 0) {
         return res.status(400).json({ error: `git clone failed: ${(git.stderr || "").trim().slice(0, 300)}` });

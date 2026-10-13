@@ -85,6 +85,10 @@ test("background shell uses the shared platform-shell resolver", async () => {
     command: "echo portable",
     cwd: TMP_HOME,
     wake: false,
+    // The detached contract is a POSIX one: on win32 a detached child gets no
+    // console and its grandchildren allocate visible ones, so the launcher
+    // detaches only where it means "survive + process-group kill".
+    platform: "linux",
     shellCommandFn: (command, options) => {
       assert.equal(command, "echo portable");
       assert.equal(options.login, true);

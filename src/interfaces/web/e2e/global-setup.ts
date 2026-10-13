@@ -36,7 +36,7 @@ export default async function globalSetup() {
 
   // 2. Throwaway project on a temp dir, initialised as an APC project.
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "apx-e2e-"));
-  execSync(`apx init . --name apx-e2e`, { cwd: tmpDir, stdio: "ignore" });
+  execSync(`apx init . --name apx-e2e`, { cwd: tmpDir, stdio: "ignore", windowsHide: true });
 
   // 3. Register it with the daemon.
   const reg = await fetch(`${DAEMON}/api/projects`, {

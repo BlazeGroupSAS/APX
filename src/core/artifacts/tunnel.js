@@ -24,7 +24,7 @@ let _cloudflared = null;
 function hasCloudflared() {
   if (_cloudflared !== null) return _cloudflared;
   try {
-    const r = spawnSync("cloudflared", ["--version"], { stdio: "ignore" });
+    const r = spawnSync("cloudflared", ["--version"], { stdio: "ignore", windowsHide: true });
     _cloudflared = !r.error && r.status === 0;
   } catch {
     _cloudflared = false;
@@ -35,7 +35,7 @@ function hasCloudflared() {
 // npx ships with npm; assume it's present when node is. Used for localtunnel.
 function hasNpx() {
   try {
-    const r = spawnSync("npx", ["--version"], { stdio: "ignore" });
+    const r = spawnSync("npx", ["--version"], { stdio: "ignore", windowsHide: true });
     return !r.error && r.status === 0;
   } catch {
     return false;
@@ -54,11 +54,13 @@ function spawnProvider(provider, port) {
   if (provider === "cloudflared") {
     return spawn("cloudflared", ["tunnel", "--url", `http://localhost:${port}`], {
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
   }
   if (provider === "localtunnel") {
     return spawn("npx", ["-y", "localtunnel", "--port", String(port)], {
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
   }
   throw new Error(`unknown tunnel provider "${provider}"`);

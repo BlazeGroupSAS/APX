@@ -86,6 +86,7 @@ export async function cmdDesktopStart(args = {}) {
       detached: false,
       stdio: ["ignore", logFd, logFd],
       env: { ...process.env, ELECTRON_ENABLE_LOGGING: "1" },
+      windowsHide: true,
     });
     fs.closeSync(logFd);
 
@@ -154,6 +155,9 @@ export async function cmdDesktopStart(args = {}) {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     env: { ...process.env, ELECTRON_ENABLE_LOGGING: "1" },
+    // The window the user sees is Electron's own; this hides the console a
+    // cmd/npx shim wrapper would otherwise pop on Windows.
+    windowsHide: true,
   });
 
   // Give the process 1.5s to fail fast, then detach and let it run

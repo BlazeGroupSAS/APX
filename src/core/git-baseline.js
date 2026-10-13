@@ -20,6 +20,7 @@ function git(cwd, args, extraEnv = {}) {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
     env: { ...process.env, ...extraEnv },
+    windowsHide: true,
   });
 }
 

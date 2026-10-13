@@ -58,7 +58,7 @@ export async function toVoiceNote(sourcePath) {
         "-b:a", VOICE_BITRATE,
         target,
       ],
-      { env: envWithPath(), timeout: 60_000 }
+      { env: envWithPath(), timeout: 60_000, windowsHide: true }
     );
   } catch {
     return null;

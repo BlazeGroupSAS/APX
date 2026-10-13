@@ -26,6 +26,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { LOG_DIR } from "#core/config/paths.js";
 import { augmentedPath } from "#core/util/path-env.js";
+import { removeAutostartPayload, wscriptRunValue } from "#core/util/win-hidden-run.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -140,6 +141,7 @@ export function serviceStatus(platform = process.platform) {
     try {
       const out = execFileSync("reg", ["query", WIN_RUN_KEY, "/v", WIN_RUN_NAME], {
         stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
       }).toString();
       installed = new RegExp(WIN_RUN_NAME).test(out);
     } catch { /* not present */ }
@@ -187,11 +189,15 @@ export function installService(platform = process.platform) {
   }
 
   if (platform === "win32") {
-    const cmdline = [...runner]
-      .map((s) => `"${String(s).replace(/"/g, '\\"')}"`).join(" ");
     try {
-      execFileSync("reg", ["add", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/t", "REG_SZ", "/d", cmdline, "/f"],
-        { stdio: "ignore" });
+      // NOT "node.exe <script>" directly in the Run value: explorer allocates
+      // a console window for console-subsystem apps, and the daemon's would
+      // stay open for the whole session. The wscript hidden-runner hops to a
+      // payload file so node spawns the daemon with structured argv and a
+      // hidden console (see win-hidden-run.js).
+      const value = wscriptRunValue("daemon", runner);
+      execFileSync("reg", ["add", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/t", "REG_SZ", "/d", value, "/f"],
+        { stdio: "ignore", windowsHide: true });
       return {
         ok: true, path: `${WIN_RUN_KEY}\\${WIN_RUN_NAME}`, supervised: false,
         note: serviceStatus("win32").note,
@@ -227,7 +233,8 @@ export function uninstallService(platform = process.platform) {
 
   if (platform === "win32") {
     try {
-      execFileSync("reg", ["delete", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/f"], { stdio: "ignore" });
+      execFileSync("reg", ["delete", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/f"], { stdio: "ignore", windowsHide: true });
+      removeAutostartPayload("daemon");
       return { ok: true, removed: true, path: `${WIN_RUN_KEY}\\${WIN_RUN_NAME}` };
     } catch {
       return { ok: true, removed: false };

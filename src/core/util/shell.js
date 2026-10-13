@@ -52,7 +52,9 @@ export function shellCommand(command, { login = false, platform = process.platfo
     return {
       file: env?.ComSpec || env?.comspec || "cmd.exe",
       args: ["/d", "/s", "/c", `"${line}"`],
-      options: { windowsVerbatimArguments: true },
+      // windowsHide: every caller is a silent capture (run_shell, routine
+      // hooks, background jobs) — a console window for cmd.exe is pure noise.
+      options: { windowsVerbatimArguments: true, windowsHide: true },
     };
   }
   return {

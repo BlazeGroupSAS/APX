@@ -20,7 +20,7 @@ import { randomUUID } from "node:crypto";
 
 function which(bin) {
   return new Promise((resolve) => {
-    execFile("which", [bin], (err, stdout) => {
+    execFile("which", [bin], { windowsHide: true }, (err, stdout) => {
       if (err) return resolve(null);
       const out = String(stdout || "").trim();
       resolve(out || null);
@@ -59,7 +59,7 @@ export default {
     if (Array.isArray(config.extra_args)) args.push(...config.extra_args.map(String));
 
     await new Promise((resolve, reject) => {
-      const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] });
+      const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
       let stderr = "";
       proc.stderr.on("data", (c) => { stderr += c.toString(); });
       proc.on("error", reject);

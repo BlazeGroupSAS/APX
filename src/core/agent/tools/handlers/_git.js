@@ -9,7 +9,7 @@ const MAX_OUTPUT_CHARS = 60_000; // ~15K tokens — generous for diffs, cuts run
 
 export function runGit(args, { cwd, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd, env: process.env });
+    const child = spawn("git", args, { cwd, env: process.env, windowsHide: true });
     let stdout = "";
     let stderr = "";
     let timedOut = false;

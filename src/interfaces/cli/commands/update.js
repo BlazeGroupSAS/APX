@@ -18,13 +18,13 @@ function isNewer(cur, lat) {
 }
 
 function hasPnpmGlobal() {
-  const r = spawnSync("pnpm", ["--version"], { encoding: "utf8", stdio: "pipe" });
+  const r = spawnSync("pnpm", ["--version"], { encoding: "utf8", stdio: "pipe", windowsHide: true });
   if (r.status !== 0) return false;
   // `pnpm add -g` needs a configured global *bin* directory (PNPM_HOME / the
   // result of `pnpm setup`). `pnpm root -g` succeeds even without it, so probe
   // `pnpm bin -g` instead — it fails with ERR_PNPM_NO_GLOBAL_BIN_DIR when the
   // global bin directory is missing.
-  const check = spawnSync("pnpm", ["bin", "-g"], { encoding: "utf8", stdio: "pipe" });
+  const check = spawnSync("pnpm", ["bin", "-g"], { encoding: "utf8", stdio: "pipe", windowsHide: true });
   return check.status === 0 && !!check.stdout?.trim();
 }
 
@@ -40,7 +40,7 @@ function detectInstaller() {
     selfDir = "";
   }
   const probe = (cmd) => {
-    const r = spawnSync(cmd, ["root", "-g"], { encoding: "utf8", stdio: "pipe" });
+    const r = spawnSync(cmd, ["root", "-g"], { encoding: "utf8", stdio: "pipe", windowsHide: true });
     return r.status === 0 ? r.stdout?.trim() || "" : "";
   };
   const pnpmRoot = probe("pnpm");

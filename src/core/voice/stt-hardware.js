@@ -16,7 +16,7 @@ import { spawnSync } from "node:child_process";
 
 function cmdOk(cmd, args = []) {
   try {
-    const r = spawnSync(cmd, args, { timeout: 1500, stdio: "ignore" });
+    const r = spawnSync(cmd, args, { timeout: 1500, stdio: "ignore", windowsHide: true });
     return r.status === 0;
   } catch {
     return false;
@@ -50,7 +50,7 @@ export function detectHardware() {
 
 function nvidiaName() {
   try {
-    const r = spawnSync("nvidia-smi", ["--query-gpu=name", "--format=csv,noheader"], { timeout: 1500, encoding: "utf8" });
+    const r = spawnSync("nvidia-smi", ["--query-gpu=name", "--format=csv,noheader"], { timeout: 1500, encoding: "utf8", windowsHide: true });
     return r.status === 0 ? (r.stdout || "").split("\n")[0].trim() || undefined : undefined;
   } catch { return undefined; }
 }

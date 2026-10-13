@@ -17,6 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DESKTOP_AUTOSTART_LOG_PATH } from "#core/config/paths.js";
+import { removeAutostartPayload, wscriptRunValue } from "#core/util/win-hidden-run.js";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { augmentedPath } from "#core/util/path-env.js";
@@ -102,6 +103,7 @@ export function autostartIsOn(platform = process.platform) {
     if (platform === "win32") {
       const out = execFileSync("reg", ["query", WIN_RUN_KEY, "/v", WIN_RUN_NAME], {
         stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
       }).toString();
       return new RegExp(WIN_RUN_NAME).test(out);
     }
@@ -115,8 +117,9 @@ export function autostartIsOn(platform = process.platform) {
  */
 export function autostartInstall(platform = process.platform) {
   const runner = getApxRunner();
+  const argv = [...runner, "desktop", "start"];
   const sh = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
-  const cmdline = [...runner, "desktop", "start"].map(sh).join(" ");
+  const cmdline = argv.map(sh).join(" ");
 
   if (platform === "darwin") {
     try {
@@ -130,10 +133,16 @@ export function autostartInstall(platform = process.platform) {
   }
   if (platform === "win32") {
     try {
+      // NOT "node.exe ... desktop start" directly in the Run value: explorer
+      // allocates a console window for console-subsystem apps, so every login
+      // would flash one. The wscript hidden-runner hops to a payload file so
+      // node spawns Electron with structured argv and a hidden console —
+      // the desktop window itself is Electron's GUI and is unaffected.
+      const value = wscriptRunValue("desktop", argv);
       execFileSync("reg", [
-        "add", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/t", "REG_SZ", "/d", cmdline, "/f",
-      ], { stdio: "ignore" });
-      return { ok: true, runs: cmdline, path: `${WIN_RUN_KEY}\\${WIN_RUN_NAME}` };
+        "add", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/t", "REG_SZ", "/d", value, "/f",
+      ], { stdio: "ignore", windowsHide: true });
+      return { ok: true, runs: value, path: `${WIN_RUN_KEY}\\${WIN_RUN_NAME}` };
     } catch (e) { return { ok: false, error: e.message }; }
   }
   if (platform === "linux") {
@@ -163,7 +172,8 @@ export function autostartUninstall(platform = process.platform) {
   }
   if (platform === "win32") {
     try {
-      execFileSync("reg", ["delete", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/f"], { stdio: "ignore" });
+      execFileSync("reg", ["delete", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/f"], { stdio: "ignore", windowsHide: true });
+      removeAutostartPayload("desktop");
       return { ok: true, removed: true, path: `${WIN_RUN_KEY}\\${WIN_RUN_NAME}` };
     } catch {
       return { ok: true, removed: false };

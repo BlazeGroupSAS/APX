@@ -166,7 +166,7 @@ export async function readDocumentText(localPath, read, { maxChars = MAX_TEXT_CH
     const { stdout } = await run(
       "pdftotext",
       ["-layout", "-nopgbrk", "-q", localPath, "-"],
-      { env: envWithPath(), timeout: 30_000, maxBuffer: 8 * 1024 * 1024 }
+      { env: envWithPath(), timeout: 30_000, maxBuffer: 8 * 1024 * 1024, windowsHide: true }
     );
     return clamp(stdout, maxChars);
   } catch {

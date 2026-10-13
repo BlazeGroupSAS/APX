@@ -41,6 +41,7 @@ async function grepWithRg({ pattern, searchPath, searchPathIsFile, glob, caseSen
   const { stdout } = await execFileAsync("rg", fullArgs, {
     maxBuffer: 8 * 1024 * 1024,
     timeout: 15000,
+    windowsHide: true,
   });
 
   const matches = [];

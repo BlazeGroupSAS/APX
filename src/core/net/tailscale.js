@@ -43,7 +43,7 @@ export function tailscaleBinary() {
     }
   }
   try {
-    const found = execFileSync("command", ["-v", "tailscale"], { shell: true, encoding: "utf8" }).trim();
+    const found = execFileSync("command", ["-v", "tailscale"], { shell: true, encoding: "utf8", windowsHide: true }).trim();
     if (found) return (cachedBinary = found);
   } catch {
     /* not on PATH either */
@@ -75,7 +75,7 @@ export async function tailscaleStatus() {
   if (!bin) return off;
   let json;
   try {
-    const { stdout } = await run(bin, ["status", "--json"], { timeout: 4000, maxBuffer: 4 << 20 });
+    const { stdout } = await run(bin, ["status", "--json"], { timeout: 4000, maxBuffer: 4 << 20, windowsHide: true });
     json = JSON.parse(stdout);
   } catch (e) {
     return { ...off, error: e?.message || String(e) };
@@ -109,7 +109,7 @@ export async function tailscaleServe(port) {
   if (!bin) return { serving: false, url: null, error: null };
   let cfg;
   try {
-    const { stdout } = await run(bin, ["serve", "status", "--json"], { timeout: 4000 });
+    const { stdout } = await run(bin, ["serve", "status", "--json"], { timeout: 4000, windowsHide: true });
     cfg = JSON.parse(stdout || "{}");
   } catch (e) {
     // `serve status` exits non-zero when nothing is being served — that is an
@@ -146,7 +146,7 @@ export async function enableTailscaleServe(port) {
     throw new Error(`tailscale is installed but not running (state: ${status.state || "unknown"}) — sign in first`);
   }
   try {
-    await run(bin, ["serve", "--bg", `http://127.0.0.1:${port}`], { timeout: 20000 });
+    await run(bin, ["serve", "--bg", `http://127.0.0.1:${port}`], { timeout: 20000, windowsHide: true });
   } catch (e) {
     const detail = (e?.stderr || e?.message || "").toString().trim();
     throw new Error(detail || "tailscale serve failed");
@@ -159,10 +159,10 @@ export async function disableTailscaleServe(port) {
   const bin = tailscaleBinary();
   if (!bin) throw new Error("tailscale is not installed");
   try {
-    await run(bin, ["serve", "--https=443", "off"], { timeout: 15000 });
+    await run(bin, ["serve", "--https=443", "off"], { timeout: 15000, windowsHide: true });
   } catch {
     // Older CLIs spell it differently; the reset form covers both.
-    await run(bin, ["serve", "reset"], { timeout: 15000 });
+    await run(bin, ["serve", "reset"], { timeout: 15000, windowsHide: true });
   }
   return tailscaleServe(port);
 }

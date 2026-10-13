@@ -815,6 +815,7 @@ function opencodeCli(args, { timeoutMs = 15000 } = {}) {
       encoding: "utf8",
       timeout: timeoutMs,
       stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
     });
   } catch {
     // Not installed, too slow, or a version without this subcommand. An engine

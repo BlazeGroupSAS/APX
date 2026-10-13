@@ -15,6 +15,7 @@ function gitBranch(dir: string): string {
       cwd: dir,
       stdio: ["ignore", "pipe", "ignore"],
       encoding: "utf8",
+      windowsHide: true,
     }).trim()
   } catch {
     return ""
@@ -215,7 +216,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       const shellID = `sh-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
       emitter.emit("event", { type: "shell.start", sessionID, shellID, command, cwd })
       return new Promise((resolve) => {
-        const child = spawn(command, { shell: true, cwd, env: process.env })
+        const child = spawn(command, { shell: true, cwd, env: process.env, windowsHide: true })
         child.stdout?.on("data", (buf) => {
           emitter.emit("event", { type: "shell.output", sessionID, shellID, stream: "stdout", chunk: buf.toString() })
         })

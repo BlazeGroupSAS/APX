@@ -58,7 +58,7 @@ async function _serverHealthInfo() {
 
 async function _findListenerPid() {
   return new Promise((resolve) => {
-    exec(`lsof -ti tcp:${WHISPER_LOCAL_PORT} -sTCP:LISTEN`, (err, stdout) => {
+    exec(`lsof -ti tcp:${WHISPER_LOCAL_PORT} -sTCP:LISTEN`, { windowsHide: true }, (err, stdout) => {
       if (err || !stdout) return resolve(null);
       const candidates = stdout.trim().split("\n")
         .map(s => parseInt(s, 10))
@@ -154,6 +154,7 @@ async function _spawnWhisper(opts, model, backend, retried) {
     stdio: ["ignore", "pipe", "inherit"],
     detached: false,
     env: envWithPath(),
+    windowsHide: true,
   });
 
   _serverProcess = proc;

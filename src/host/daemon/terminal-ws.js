@@ -99,6 +99,7 @@ export function startTerminalSession(ws, req, { python = "python3", home = os.ho
     child = spawn(python, [BRIDGE, String(rows), String(cols), ...target.argv], {
       cwd: target.cwd,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
   } catch (e) {
     say(`could not start a terminal: ${e.message}`);

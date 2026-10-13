@@ -49,6 +49,7 @@ function deliverViaApx(payload) {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 60_000,
+    windowsHide: true,
   });
 }
 
